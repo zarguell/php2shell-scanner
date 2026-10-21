@@ -50,6 +50,18 @@ PATCHED_FLEET = {
     "matomo/8.4.27": 19106,
 }
 
+# GENUINE pre-patch vendor images (docker-compose.prepatch.yml), pushed before
+# 2026-10-21 with the PHP of their era. Expectation per row pinned from
+# observed behavior (see README fleet table): oracle-positive where the app's
+# PHP layer leaks warnings, version-verdict where errors are off.
+PREPATCH_FLEET = {
+    # name: (port, expected_verdict, expected_php)
+    "drupal:11.2-apache": (19301, "VULNERABLE", "8.4.23"),
+    "mediawiki:1.44.0": (19303, "VULNERABLE", "8.1.33"),
+    "roundcube:1.6.1-apache": (19304, "LIKELY_VULNERABLE", "8.1.17"),  # EOL + errors off
+    "matomo:5.2.2-apache": (19305, "LIKELY_VULNERABLE", "8.3.17"),  # errors off
+    "phpmyadmin:5.2.1-apache": (19306, "LIKELY_VULNERABLE", "8.2.27"),  # errors off
+}
 
 class TestVersions(unittest.TestCase):
     def test_parse_full(self):
@@ -310,6 +322,17 @@ class TestAffectedFleet(unittest.TestCase):
                 self.assertEqual(f.verdict, "PATCHED",
                                  f"{name}:{port} got {f.verdict} ({f.detail})")
                 self.assertFalse(f.oracle_positive, f.oracle_evidence)
+
+    def test_prepatch_apps_detected(self):
+        # Genuine old vendor images: every one must be flagged (oracle or
+        # version verdict — never PATCHED, never silent).
+        for name, (port, want, want_php) in PREPATCH_FLEET.items():
+            with self.subTest(app=name):
+                f = self._scan(port)
+                self.assertEqual(f.verdict, want,
+                                 f"{name}:{port} got {f.verdict} ({f.detail})")
+                self.assertIn(want_php, f.php_version or "", f.detail)
+                self.assertNotIn(f.verdict, ("PATCHED", "NO_PHP_SIGNAL"))
 
 
 if __name__ == "__main__":

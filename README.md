@@ -102,6 +102,25 @@ VULNERABLE). Run both fleet composes up, then
 
 *DB-less WP answers 500 on `/` but its static assets attribute the PHP app.
 
+### Genuine pre-patch vendor images (pushed before 2026-10-21)
+
+Old tags, the PHP of their era, scanned live via
+`tests/lab/docker-compose.prepatch.yml` (`--fleet`). Every one flagged —
+none silent, none PATCHED:
+
+| Image (pushed) | Bundled PHP | Verdict |
+|---|---|---|
+| `drupal:11.2-apache` (2026-07) | 8.4.23 | VULNERABLE (oracle 3/3) |
+| `mediawiki:1.44.0` (2025-10) | 8.1.33 (EOL) | VULNERABLE (oracle 3/3) |
+| `matomo:5.2.2-apache` (2025-03) | 8.3.17 | LIKELY_VULNERABLE (version; app errors off) |
+| `phpmyadmin:5.2.1-apache` (2025-01) | 8.2.27 | LIKELY_VULNERABLE (version; app errors off) |
+| `roundcube/roundcubemail:1.6.1-apache` (2023-04) | 8.1.17 (EOL) | LIKELY_VULNERABLE (EOL version; app errors off) |
+| `joomla:5.3-apache` (2025-10) | 8.3.26 | not bootable w/o MySQL (tag data recorded, no live row) |
+
+Note the honest split: apps whose PHP layer leaks warnings go oracle-positive;
+apps with `display_errors=Off` fall back to the version verdict — still
+flagged, lower confidence. That is the documented errors-off blind spot, and
+the version layer covers it whenever headers disclose.
 Known limitation: with `display_errors=Off` and version hidden, remote
 black-box detection is impossible without exploitation — the scanner reports
 `NO_PHP_SIGNAL`/`PHP_NO_VERSION` instead of guessing. Version-only findings

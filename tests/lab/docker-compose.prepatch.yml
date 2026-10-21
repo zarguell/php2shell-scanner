@@ -1,0 +1,29 @@
+# Pre-patch app fleet — genuine old vendor images (pushed BEFORE 2026-10-21).
+# These bundle the PHP their era shipped: 8.4.23 / 8.3.26 / 8.3.17 (vulnerable
+# branches, pre-fix) and 8.1.33 / 8.1.17 (EOL). Boots as-is, no DB needed for
+# the fingerprinted endpoints (installer pages, static assets, login screens).
+#   docker compose -f tests/lab/docker-compose.prepatch.yml up -d
+# Lab-only. Never expose publicly.
+services:
+  old-drupal:
+    image: drupal:11.2-apache
+    ports: ["19301:80"]
+  old-joomla:
+    image: joomla:5.3-apache
+    ports: ["19302:80"]
+    environment:
+      JOOMLA_DB_HOST: "none:3306"
+  old-mediawiki:
+    image: mediawiki:1.44.0
+    ports: ["19303:80"]
+  old-roundcube:
+    image: roundcube/roundcubemail:1.6.1-apache
+    ports: ["19304:80"]
+  old-matomo:
+    image: matomo:5.2.2-apache
+    ports: ["19305:80"]
+  old-pma:
+    image: phpmyadmin:5.2.1-apache
+    ports: ["19306:80"]
+    environment:
+      PMA_HOST: "none"
