@@ -80,6 +80,28 @@ python3 tests/test_scanner.py          # unit tests (no network)
 python3 tests/test_scanner.py --live   # unit + live lab (33 tests)
 ```
 
+## Affected-product fleet (pressure test)
+
+Real projects from [docs/affected-products.md](docs/affected-products.md),
+scanned live 2026-10-21. Vendor images ship patched PHP (all PATCHED, oracle
+negative — zero false positives on real apps); the same app code rebuilt on
+PHP 8.5.11 via `tests/lab/build-vuln-fleet.sh` fires the oracle (all
+VULNERABLE). Run both fleet composes up, then
+`python3 tests/test_scanner.py --fleet`.
+
+| App | Vendor PHP | Verdict | Same app on PHP 8.5.11 | Verdict |
+|---|---|---|---|---|
+| Drupal 11 | 8.5.12 | PATCHED | Drupal 11 | VULNERABLE (3/3) |
+| MediaWiki 1.46.2 | 8.3.36 | PATCHED | — (500M src, on-demand) | — |
+| Roundcube 1.7 | 8.4.27 | PATCHED | Roundcube 1.7 | VULNERABLE (3/3) |
+| Nextcloud | 8.5.12 | PATCHED | — (800M src, on-demand) | — |
+| Matomo | 8.4.27 | PATCHED | Matomo | VULNERABLE (3/3) |
+| WordPress | 8.3.x (patched) | PHP_NO_VERSION* | WordPress | VULNERABLE (3/3) |
+| phpMyAdmin 5.2 | 8.3.36 | PATCHED | — (covered by WP/RC/MT) | — |
+| Joomla 6.1 | 8.4.27 | not bootable w/o MySQL | — | — |
+
+*DB-less WP answers 500 on `/` but its static assets attribute the PHP app.
+
 Known limitation: with `display_errors=Off` and version hidden, remote
 black-box detection is impossible without exploitation — the scanner reports
 `NO_PHP_SIGNAL`/`PHP_NO_VERSION` instead of guessing. Version-only findings

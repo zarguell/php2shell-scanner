@@ -29,6 +29,26 @@ LAB = {  # service -> (port, expected_verdict)
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
+FLEET_LIVE = os.environ.get("P2S_FLEET") == "1" or "--fleet" in sys.argv
+
+# Real affected-product apps on KNOWN-VULNERABLE PHP 8.5.11
+# (docker-compose.vulnfleet.yml). All must be oracle-VULNERABLE.
+VULN_FLEET = {
+    "vDrupal/11": 19201,
+    "vMatomo": 19203,
+    "vRoundcube/1.7": 19204,
+    "vWordpress": 19206,
+}
+
+# Real affected-product apps on PATCHED vendor PHP (docker-compose.fleet.yml).
+# All must be PATCHED with oracle negative (no false positives on real apps).
+PATCHED_FLEET = {
+    "drupal:apache/8.5.12": 19101,
+    "mediawiki:stable/8.3.36": 19103,
+    "roundcube/8.4.27": 19104,
+    "nextcloud:apache/8.5.12": 19105,
+    "matomo/8.4.27": 19106,
+}
 
 
 class TestVersions(unittest.TestCase):
@@ -260,8 +280,43 @@ class TestLiveLab(unittest.TestCase):
         self.assertIn("NO_PHP_SIGNAL", r.stdout)
 
 
+@unittest.skipUnless(FLEET_LIVE, "needs app fleets (P2S_FLEET=1 or --fleet)")
+class TestAffectedFleet(unittest.TestCase):
+    """Pressure test on REAL affected products from docs/affected-products.md:
+    vendor images (patched PHP -> PATCHED, oracle negative) and rebuilt
+    vuln-fleet images (real app code on PHP 8.5.11 -> oracle VULNERABLE)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.opener = S.make_opener(12, False)
+
+    def _scan(self, port):
+        res = S.scan_endpoint("127.0.0.1", port, 12, False, True, False, False, self.opener)
+        self.assertTrue(res, f"no findings for port {port}")
+        return res[0]
+
+    def test_vuln_apps_fire_oracle(self):
+        for name, port in VULN_FLEET.items():
+            with self.subTest(app=name):
+                f = self._scan(port)
+                self.assertEqual(f.verdict, "VULNERABLE",
+                                 f"{name}:{port} got {f.verdict} ({f.detail})")
+                self.assertTrue(f.oracle_positive, f.oracle_evidence)
+                self.assertIn("8.5.11", f.php_version or "")
+
+    def test_patched_apps_no_false_positive(self):
+        for name, port in PATCHED_FLEET.items():
+            with self.subTest(app=name):
+                f = self._scan(port)
+                self.assertEqual(f.verdict, "PATCHED",
+                                 f"{name}:{port} got {f.verdict} ({f.detail})")
+                self.assertFalse(f.oracle_positive, f.oracle_evidence)
+
+
 if __name__ == "__main__":
     if "--live" in sys.argv:
         sys.argv.remove("--live")
         os.environ["P2S_LIVE"] = "1"
+    if "--fleet" in sys.argv:
+        sys.argv.remove("--fleet")
+        os.environ["P2S_FLEET"] = "1"
     unittest.main(verbosity=2)

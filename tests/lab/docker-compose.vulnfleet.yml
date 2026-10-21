@@ -1,0 +1,28 @@
+# Vulnerable-app fleet: real project code on KNOWN-VULNERABLE PHP 8.5.11.
+# Proves the scanner attributes + oracle-fires on actual affected products,
+# not just synthetic index.php stubs. Build once:
+#   ./tests/lab/build-vuln-fleet.sh drupal wordpress roundcube matomo
+#   (mediawiki/nextcloud: 500M/800M sources — build on demand via same script)
+# Run:
+#   docker compose -f tests/lab/docker-compose.vulnfleet.yml up -d
+# Lab-only. Never expose publicly.
+services:
+  vDrupal:
+    image: php2shell-fleet/drupal:8.5.11
+    ports: ["19201:80"]
+  vMatomo:
+    image: php2shell-fleet/matomo:8.5.11
+    ports: ["19203:80"]
+  vRoundcube:
+    image: php2shell-fleet/roundcube:8.5.11
+    ports: ["19204:80"]
+  vWordpress:
+    image: php2shell-fleet/wordpress:8.5.11
+    ports: ["19206:80"]
+  # On-demand (uncomment after building):
+  # vMediawiki:
+  #   image: php2shell-fleet/mediawiki:8.5.11
+  #   ports: ["19202:80"]
+  # vNextcloud:
+  #   image: php2shell-fleet/nextcloud:8.5.11
+  #   ports: ["19205:80"]

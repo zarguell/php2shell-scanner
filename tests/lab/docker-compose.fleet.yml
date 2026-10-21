@@ -1,0 +1,23 @@
+# App fleet — affected-products pressure test (not part of the unit lab).
+# Each service boots a real project image; run on demand:
+#   docker compose -f tests/lab/docker-compose.fleet.yml up -d
+# Lab-only. Never expose publicly.
+services:
+  fleet-drupal:
+    image: drupal:apache
+    ports: ["19101:80"]
+  fleet-joomla:
+    image: joomla:6.1-apache
+    ports: ["19102:80"]
+  fleet-mediawiki:
+    image: mediawiki:stable
+    ports: ["19103:80"]
+  fleet-roundcube:
+    image: roundcube/roundcubemail:latest
+    ports: ["19104:80"]
+  fleet-nextcloud:
+    image: nextcloud:apache
+    ports: ["19105:80"]
+  fleet-matomo:
+    image: matomo:latest
+    ports: ["19106:80"]
