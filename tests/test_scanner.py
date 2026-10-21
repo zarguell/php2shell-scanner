@@ -23,6 +23,9 @@ LAB = {  # service -> (port, expected_verdict)
     "notphp": (19085, "NO_PHP_SIGNAL"),
     "static-only": (19086, "NO_PHP_SIGNAL"),
     "upload-disabled": (19087, "LIKELY_VULNERABLE"),  # oracle neg, version vuln
+    "vague-hardened": (19088, "VULNERABLE"),  # no headers; oracle via discovered /search.php
+    "wordpress-vuln": (19089, "PHP_NO_VERSION"),  # WP assets prove PHP app, version silent
+    "pma": (19090, "PATCHED"),  # phpMyAdmin on PHP 8.3.36
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -109,9 +112,9 @@ class TestFingerprint(unittest.TestCase):
         _, _, sigs, _ = self.fp({"Server": "nginx"}, '<a href="i.php">x</a>')
         self.assertIn("body:.php-link", sigs)
         _, _, sigs, _ = self.fp(body='<script src="/wp-includes/x.js">')
-        self.assertIn("body:wordpress", sigs)
+        self.assertIn("body:app-wordpress", sigs)
         _, _, sigs, _ = self.fp(body='<input name="_token" data-csrf-token>')
-        self.assertIn("body:laravel", sigs)
+        self.assertIn("body:app-laravel", sigs)
 
 
 class TestOracleBody(unittest.TestCase):
@@ -209,6 +212,23 @@ class TestLiveLab(unittest.TestCase):
     def test_oracle_positive_on_vuln(self):
         f = self._scan(19081)
         self.assertTrue(f.oracle_positive, f.oracle_evidence)
+
+    def test_vague_hardened_found_via_path_discovery(self):
+        # no X-Powered-By, static front page — oracle fires on /search.php
+        f = self._scan(19088)
+        self.assertEqual(f.verdict, "VULNERABLE", f.detail)
+        self.assertIsNone(f.php_version)
+        self.assertIn("/search.php", f.oracle_evidence)
+
+    def test_wordpress_proves_php_app(self):
+        f = self._scan(19089)
+        self.assertEqual(f.verdict, "PHP_NO_VERSION", f.detail)
+        self.assertTrue(any("wordpress" in h for h in f.app_hits), f.app_hits)
+
+    def test_pma_patched(self):
+        f = self._scan(19090)
+        self.assertEqual(f.verdict, "PATCHED", f.detail)
+        self.assertEqual(f.php_version, "8.3.36")
 
     def test_oracle_tiny_request(self):
         # regression: scanner must never send exploit-sized bodies

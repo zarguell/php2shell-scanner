@@ -60,7 +60,7 @@ it is not RCE by itself. Defense-in-depth still says disable it if unused
 
 ## 4. How detection works (what this scanner uses)
 
-Two independent layers; either can fire, both together = highest confidence.
+Three layers; either can fire, agreement = highest confidence.
 
 ### Layer A — version fingerprint (passive, zero-risk)
 `X-Powered-By: PHP/x.y.z` / `Server: ... PHP/x.y.z` / exposed `phpinfo()`.
@@ -96,10 +96,30 @@ no code execution — it only observes error output. Credit: PortSwigger
 BCheck/active check by Tom SL; behavior confirmed against live Docker
 `php:8.5.11-apache` vs `php:8.5-apache` (8.5.12) in this repo's test lab.
 
+### Layer C — safe GET probes for vague/hardened boxes (no POST, no state)
+
+Headers lie by omission: `expose_php=Off` strips `X-Powered-By`, front pages go
+static, and the oracle needs a PHP-executing path. Three GET-only follow-ups
+(~11 requests, the traffic of a casual crawler) close the gap:
+
+- **PHP path discovery.** GET candidates (`/app.php`, `/search.php`,
+  `/wp-login.php`, …); a path proves PHP execution via `X-Powered-By: PHP`,
+  `PHPSESSID` cookie, `.php` redirect, or *dynamic* query handling (output
+  changes with `?q=<random>` → server-side code ran). The oracle POST then
+  goes to discovered paths, not just `/`. Lab proof: a header-stripped
+  8.5.11 box with a static front page fires 3/3 via `/search.php`.
+- **Easter-egg GUIDs** (`/?=PHPE9568F36-…`, `?=PHPB8B5F2A0-…`). Compiled into
+  every PHP binary, answered without app code — but only when `expose_php=On`
+  AND the request reaches PHP. Positive requires `image/*` content-type
+  (never status/body alone).
+- **PHP-only app endpoints.** WordPress (`wp-login.php`, `xmlrpc.php`, static
+  `wp-includes` assets + `readme.html`), phpMyAdmin, Nextcloud `status.php`,
+  MediaWiki, Drupal — each runs *exclusively* on PHP, so 200 + content match
+  proves a PHP runtime with zero version disclosure → `PHP_NO_VERSION`
+  (medium) instead of silence. Lab proof: DB-less WordPress with silent
+  headers still attributes via static assets.
+
 ### What the scanner deliberately does NOT do
-No stalled-multipart triggers, no heap spray, no session-injection canaries,
-no worker-crash observation, no payload execution. Those are exploitation
-primitives (see murrez/dinosn/0x4148 PoCs) — out of scope by design.
 
 ## 5. Hardening / mitigation notes (not fixes)
 

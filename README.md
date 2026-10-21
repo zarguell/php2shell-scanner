@@ -13,13 +13,20 @@ or are explicitly authorized to test.
 
 1. **Version fingerprint** (passive): `X-Powered-By` / `Server` / `phpinfo()`
    compared to the official fixed-release table. Below-fix → LIKELY_VULNERABLE;
-   ≤ 8.1 → EOL_VULNERABLE; at/above fix → PATCHED.
+   ≤ 8.1 → EOL_VULNERABLE; at/above fix → PATCHED. Header values must name PHP
+   (Tomcat/WordPress/ASP.NET numbers never count).
 2. **Session-write oracle** (active, benign): one tiny multipart POST with an
-   invalid session id. Unpatched builds echo 3 warnings; patched builds echo
-   only 2 (fix removed the write-warning path). 3/3 → VULNERABLE, high
-   confidence. See [docs/RESEARCH.md](docs/RESEARCH.md) for the full write-up
-   and sources.
-
+   invalid session id, sent to `/` plus any discovered PHP-executing path.
+   Unpatched builds echo 3 warnings; patched builds echo only 2 (fix removed
+   the write-warning path). 3/3 → VULNERABLE, high confidence.
+3. **Safe GET probes for vague/hardened boxes** (no POST, no state change):
+   PHP easter-egg GUIDs (`?=PHP…`, answered inside the PHP binary only),
+   well-known PHP-app endpoints (`wp-login.php`, `xmlrpc.php`, phpMyAdmin,
+   Nextcloud `status.php`, … — 200 + content match required), and PHP path
+   discovery (`/app.php`, `/search.php`, … proven dynamic via query-reflection
+   GETs, then oracle-tested). A WordPress/phpMyAdmin/Drupal behind stripped
+   headers still resolves to PHP_NO_VERSION (medium) instead of silence.
+   See [docs/RESEARCH.md](docs/RESEARCH.md) for the full write-up and sources.
 ## Quick start
 
 ```sh
@@ -51,15 +58,18 @@ Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 
 ## Test lab (transparency)
 
-`tests/lab/docker-compose.yml` spins 7 local scenarios; `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-21 — 22/22 green:
+`tests/lab/docker-compose.yml` spins 10 local scenarios; `tests/test_scanner.py`
+asserts every verdict live. Last verified 2026-10-21 — 33/33 green:
 
 | Service | Image | Result |
 |---|---|---|
 | vuln-error-on (`:19081`) | php:8.5.11, errors on | VULNERABLE (oracle 3/3) |
 | eol-old (`:19084`) | php:8.3.6 | VULNERABLE (oracle 3/3) |
+| vague-hardened (`:19088`) | php:8.5.11, headers stripped, static front | VULNERABLE (oracle 3/3 via discovered `/search.php`) |
 | upload-disabled (`:19087`) | php:8.5.11, progress off | LIKELY_VULNERABLE (version; oracle 0/3 — mitigation signal) |
 | patched (`:19083`) | php:8.5.12 | PATCHED (oracle 2/3 — no false positive) |
+| pma (`:19090`) | phpMyAdmin on PHP 8.3.36 | PATCHED (app + version agree) |
+| wordpress-vuln (`:19089`) | WordPress, headers silent | PHP_NO_VERSION (WP assets prove PHP app) |
 | vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (known blind spot, documented) |
 | notphp (`:19085`) | nginx | NO_PHP_SIGNAL |
 | static-only (`:19086`) | no PHP handler at `/` | NO_PHP_SIGNAL |
@@ -67,7 +77,7 @@ asserts every verdict live. Last verified 2026-10-21 — 22/22 green:
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (22 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (33 tests)
 ```
 
 Known limitation: with `display_errors=Off` and version hidden, remote

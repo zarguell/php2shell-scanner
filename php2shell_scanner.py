@@ -214,10 +214,9 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], 
             signals.append("body:PHPSESSID")
         if re.search(r'\.php["\'\s>]', body):
             signals.append("body:.php-link")
-        if re.search(r"wp-content|wp-includes|/wp-json/|wordpress", body, re.I):
-            signals.append("body:wordpress")
-        if re.search(r"laravel|__laravel|csrf-token", body, re.I):
-            signals.append("body:laravel")
+        for app, rx in APP_BODY_RX:
+            if rx.search(body):
+                signals.append(f"body:app-{app}")
         m = PHPINFO_VER_RE.search(body)
         if m and version is None:
             version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
@@ -237,6 +236,56 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], 
     return version, source, signals, branch_only
 
 
+# PHP-only application fingerprints: each app below runs EXCLUSIVELY on PHP,
+# so observing it proves a PHP runtime even with zero version disclosure.
+# (name, body-regex, well-known probe path returning app-specific content)
+APP_BODY_RX = [
+    ("wordpress", re.compile(r"wp-content|wp-includes|/wp-json/|wordpress", re.I)),
+    ("laravel", re.compile(r"laravel|_token|csrf-token", re.I)),
+    ("drupal", re.compile(r"drupal|sites/default/files|Drupal\.settings", re.I)),
+    ("joomla", re.compile(r"joomla|/media/jui/|com_content", re.I)),
+    ("phpmyadmin", re.compile(r"phpmyadmin|pma_|PhpMyAdmin", re.I)),
+    ("nextcloud", re.compile(r"nextcloud|/apps/files/|ocs-provider", re.I)),
+    ("owncloud", re.compile(r"owncloud", re.I)),
+    ("mediawiki", re.compile(r"mediawiki|mw-config|/load\.php", re.I)),
+    ("symfony", re.compile(r"symfony|_wdt|/bundles/", re.I)),
+    ("codeigniter", re.compile(r"codeigniter|ci_session", re.I)),
+    ("magento", re.compile(r"magento|/static/version|mage/cookies", re.I)),
+    ("prestashop", re.compile(r"prestashop", re.I)),
+    ("matomo", re.compile(r"matomo|piwik", re.I)),
+]
+
+# Safe active probes: each is a normal GET a browser/crawler would issue.
+# Easter-egg GUIDs (?=PHPxxxxxx) are compiled into every PHP binary and
+# answered WITHOUT executing app code — but ONLY when expose_php=On AND the
+# request reaches the PHP handler. No POST, no upload, no state change.
+EGG_PROBES = (
+    # (query, marker-in-response, description)
+    ("?=PHPE9568F36-D428-11d2-A769-00AA001ACF42", "PHP Logo", "php-logo GUID"),
+    ("?=PHPB8B5F2A0-3C92-11d3-A3A9-4C7B08C10000", "Zend Logo", "zend-logo GUID"),
+)
+
+# Well-known app endpoints that prove a PHP app serves this host. All plain
+# GETs of public files; 200 + content match required (status alone is not
+# evidence — custom 404 pages return 200 on some stacks).
+APP_PROBES = (
+    # (path, must-match-rx, signal)
+    ("/wp-login.php", re.compile(r"wordpress|wp-", re.I), "app-wordpress:wp-login.php"),
+    ("/wp-includes/version.php", re.compile(r"\$wp_version\s*=", re.I), "app-wordpress:version.php"),
+    ("/xmlrpc.php", re.compile(r"XML-RPC|xmlrpc", re.I), "app-wordpress:xmlrpc.php"),
+    # Static WP assets: served without PHP/DB, but path+content is WP-only
+    # (proves a PHP app is deployed even when PHP itself stays silent).
+    ("/wp-includes/js/jquery/jquery.min.js", re.compile(r"jquery", re.I), "app-wordpress:static-asset"),
+    ("/readme.html", re.compile(r"wordpress", re.I), "app-wordpress:readme"),
+    ("/phpmyadmin/index.php", re.compile(r"phpmyadmin|pma", re.I), "app-phpmyadmin:index"),
+    ("/phpMyAdmin/index.php", re.compile(r"phpmyadmin|pma", re.I), "app-phpmyadmin:index"),
+    ("/index.php/login", re.compile(r"nextcloud|owncloud", re.I), "app-nextcloud:login"),
+    ("/status.php", re.compile(r'"(version|productname)"', re.I), "app-nextcloud:status"),
+    ("/mediawiki/load.php", re.compile(r"mediawiki|mw", re.I), "app-mediawiki:load"),
+    ("/user/login", re.compile(r"drupal", re.I), "app-drupal:login"),
+)
+
+
 ORACLE_PATHS = ("/", "/index.php")
 
 def build_oracle_body(boundary: str, token: str, fname: str) -> bytes:
@@ -247,13 +296,85 @@ def build_oracle_body(boundary: str, token: str, fname: str) -> bytes:
     ]
     return "".join(parts).encode()
 
+# Candidate PHP paths: probed with a harmless GET first; only paths that
+# actually execute PHP (PHP-specific content-type or dynamic behavior — NOT
+# status alone) get the oracle POST. This is how a vague hardened box with
+# PHP hiding at /app.php gets found without spraying POSTs everywhere.
+PHP_PATH_CANDIDATES = (
+    "/", "/index.php", "/app.php", "/search.php", "/api.php", "/ajax.php",
+    "/login.php", "/admin.php", "/wp-login.php", "/xmlrpc.php",
+)
+
+
+def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
+    """Heuristic: does this GET response prove the path runs PHP?
+    Positive signals: X-Powered-By PHP, PHPSESSID cookie, .php in Location,
+    or body differing from a static file (query reflection counts)."""
+    if res.get("status") not in (200, 500):
+        return False
+    for k, v in res.get("headers", {}).items():
+        kl = k.lower()
+        if kl == "x-powered-by" and "php" in str(v).lower():
+            return True
+        if kl == "set-cookie" and "phpsessid" in str(v).lower():
+            return True
+        if kl == "location" and ".php" in str(v).lower():
+            return True
+    return False
+
+
+def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
+    """GET each candidate path; return paths proving PHP execution.
+    Proof = X-Powered-By PHP, PHPSESSID cookie, .php redirect, or dynamic
+    query reflection (?x=<rand> echoed → server-side code ran). All safe GETs."""
+    base = url.rstrip("/")
+    found: list[str] = []
+    probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
+    for p in PHP_PATH_CANDIDATES:
+        target = base + p if p != "/" else url
+        try:
+            res = http_request(opener, target, timeout)
+            if res.get("status") == 404:
+                continue  # no such path — never a PHP endpoint here
+            if looks_like_php_response(res):
+                found.append(p)
+                continue
+            if res.get("status") == 200 and p.endswith(".php"):
+                body1 = res.get("body") or ""
+                # two dynamic probes: bare random param AND common 'q' param
+                # (many search/app endpoints read ?q= / ?s= / ?id= but ignore
+                # unknown params — output only changes with a consumed name)
+                r2 = http_request(opener, target + f"?{probe_token}=1", timeout)
+                body2 = r2.get("body") or ""
+                if r2.get("status") == 200 and probe_token in body2:
+                    found.append(p)  # reflected token → code executed
+                    continue
+                if body2 != body1:
+                    found.append(p)  # query changed output → dynamic handler
+                    continue
+                r3 = http_request(opener, target + f"?q={probe_token}", timeout)
+                body3 = r3.get("body") or ""
+                if r3.get("status") == 200 and (probe_token in body3 or body3 != body1):
+                    found.append(p)  # consumed ?q= → dynamic handler
+                    continue
+        except Exception:
+            continue
+    # / always tried (oracle is harmless); discovered .php paths added
+    paths = ["/"] + [p for p in found if p != "/"]
+    return paths
+
 
 def run_oracle(opener, url: str, timeout: float) -> tuple[bool, str]:
-    """Return (positive, evidence). Tries ORACLE_PATHS; positive requires
-    ALL THREE markers on any path (matches PortSwigger check)."""
+    """Return (positive, evidence). Discovers PHP-executing paths via safe
+    GETs, then POSTs the tiny oracle to each. Positive requires ALL THREE
+    markers on any path (matches PortSwigger check)."""
     base = url.rstrip("/")
     last_ev = "not run"
-    for p in ORACLE_PATHS:
+    try:
+        paths = discover_php_paths(opener, url, timeout)
+    except Exception:
+        paths = list(ORACLE_PATHS)
+    for p in paths:
         target = base + p if p != "/" else url
         boundary = "----p2s" + "".join(random.choice("abcdef0123456789") for _ in range(24))
         token = "".join(random.choice("abcdef0123456789") for _ in range(20))
@@ -272,6 +393,39 @@ def run_oracle(opener, url: str, timeout: float) -> tuple[bool, str]:
     return False, last_ev
 
 
+def run_easter_eggs(opener, url: str, timeout: float) -> tuple[bool, str]:
+    """GET ?=PHP<GUID> easter eggs. Positive only on image/gif + logo marker.
+    Safe: plain GET handled inside the PHP binary (no app code, no state)."""
+    base = url.rstrip("/")
+    for q, marker, desc in EGG_PROBES:
+        res = http_request(opener, base + "/" + q, timeout)
+        if res.get("status") != 200:
+            continue
+        ctype = next((v for k, v in res.get("headers", {}).items()
+                      if k.lower() == "content-type"), "")
+        if "image" not in ctype.lower():
+            continue
+        if len(res.get("body", "")) > 100:  # GIF bytes decode large; any real image body qualifies
+            return True, f"easter-egg {desc} ({ctype})"
+    return False, "easter-eggs absent (expose_php=Off or non-PHP handler)"
+
+
+def run_app_probes(opener, url: str, timeout: float,
+                   max_probes: int = 9) -> tuple[list[str], list[str]]:
+    """GET well-known PHP-app endpoints. Returns (hits, tried).
+    A hit needs HTTP 200 AND app-specific content (never status alone)."""
+    base = url.rstrip("/")
+    hits: list[str] = []
+    tried = 0
+    for path, rx, signal in APP_PROBES[:max_probes]:
+        tried += 1
+        try:
+            res = http_request(opener, base + path, timeout)
+        except Exception:
+            continue
+        if res.get("status") == 200 and res.get("body") and rx.search(res["body"]):
+            hits.append(signal)
+    return hits, [p for p, _, _ in APP_PROBES[:max_probes]]
 # ---------------------------------------------------------------- model
 
 @dataclass
@@ -293,12 +447,15 @@ class Finding:
     oracle_ran: bool = False
     oracle_positive: bool = False
     oracle_evidence: str = ""
+    egg_ran: bool = False
+    egg_positive: bool = False
+    egg_evidence: str = ""
+    app_hits: list[str] = field(default_factory=list)
     signals: list[str] = field(default_factory=list)
     reverse_dns: str | None = None
     verdict: str = "UNREACHABLE"
     confidence: str = "none"
     detail: str = ""
-
 
 def decide(f: Finding) -> Finding:
     if not f.reachable:
@@ -334,10 +491,19 @@ def decide(f: Finding) -> Finding:
             f.detail = f.version_detail
         return f
     if f.php_detected:
+        proven = f.egg_positive or bool(f.app_hits)
         f.verdict = "PHP_NO_VERSION"
-        f.confidence = "low"
-        f.detail = ("PHP signals present but version undisclosed "
-                    f"({', '.join(f.signals[:4])}); manual review needed")
+        f.confidence = "medium" if proven else "low"
+        why = []
+        if f.egg_positive:
+            why.append(f"easter-egg ({f.egg_evidence})")
+        if f.app_hits:
+            why.append(f"PHP-only app ({', '.join(f.app_hits[:3])})")
+        if not why:
+            why.append(', '.join(f.signals[:4]) or "weak signals")
+        f.detail = ("PHP runtime proven but version undisclosed (" + "; ".join(why) + "); "
+                    "assume vulnerable until patched version proven — "
+                    + ("oracle negative" if f.oracle_ran else "run oracle; blind spot if display_errors=Off"))
         return f
     f.verdict = "NO_PHP_SIGNAL"
     f.confidence = "low"
@@ -420,6 +586,27 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
             except Exception as e:
                 f.oracle_evidence = f"oracle error: {e}"
+        # Safe GET-only follow-ups when PHP is unproven or versionless: a
+        # vague hardened box gets ~11 extra plain GETs (eggs + app paths),
+        # no POST, no uploads, no state change. Skip when a version already
+        # classified (nothing to gain) — unless signals exist without version.
+        if f.reachable and (not ver or sigs):
+            try:
+                epos, eev = run_easter_eggs(opener, url, timeout)
+                f.egg_ran, f.egg_positive, f.egg_evidence = True, epos, eev
+                if epos:
+                    f.php_detected = True
+                    f.signals.append(f"easter-egg:{eev}")
+            except Exception as e:
+                f.egg_evidence = f"egg error: {e}"
+            try:
+                hits, _ = run_app_probes(opener, url, timeout)
+                if hits:
+                    f.php_detected = True
+                    f.app_hits = hits
+                    f.signals.extend(hits)
+            except Exception:
+                pass
         out.append(decide(f))
         if scheme == "http" and f.reachable:
             break  # plain-HTTP answered; skip https guess on non-standard ports
