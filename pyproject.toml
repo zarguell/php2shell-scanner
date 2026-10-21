@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php2shell-scanner"
+version = "1.0.0"
+description = "Non-destructive network scanner for php2shell (CVE-2026-109618/CVE-2026-109619)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "zarguell" }]
+
+[project.scripts]
+php2shell-scanner = "php2shell_scanner:main"
+
+[tool.setuptools]
+py-modules = ["php2shell_scanner"]

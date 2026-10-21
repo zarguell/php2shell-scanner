@@ -1,0 +1,132 @@
+# php2shell — Research Notes (CVE-2026-109618 / CVE-2026-109619)
+
+> Scanner, not exploiter. This document explains the vulnerability class and
+> why the scanner's signals are reliable. All facts verified against the
+> primary sources listed at the bottom on 2026-10-21.
+
+## 1. What happened
+
+On 20–21 Oct 2026 the PHP project shipped an out-of-band security release for
+two critical PHP-core RCEs (CVSS v4.0 **9.2** each), fix releases **8.5.12,
+8.4.27, 8.3.36, 8.2.35**. Details leaked early and a PoC tool circulated as
+"php2shell". PHP 8.1 and older are EOL — no upstream fix; distros/LTS vendors
+may backport, and the PHP team published minimal source backports for
+7.4/8.0/8.1.
+
+- CVE-2026-109618 (GHSA-w8hw-w9fx-j79w): OOM handling can interrupt PHP while
+  internal request data is only partly initialised; request cleanup then treats
+  the invalid data as valid → RCE. CWE-755 + CWE-416.
+- CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp): request-owned global state can survive
+  after its memory is freed; a later request on the same (persistent) worker
+  reuses the stale state → RCE. CWE-416 (use-after-free).
+
+Both are **unauthenticated**, pre-application-code in the worst case (mod_php:
+trigger fires before app code runs). Every web SAPI at risk: PHP-FPM, mod_php,
+php-cgi, FrankenPHP, LiteSpeed. Risk highest on persistent workers (FPM,
+mod_php); plain per-request CGI is far less exposed to 619's cross-request
+stale state.
+
+## 2. Root mechanism (one paragraph each)
+
+**618 — OOM teardown confusion.** PHP uses `longjmp` to bail out of the current
+context on out-of-memory. If the OOM lands mid-request-startup, partially
+initialised request structures are left published; the shutdown path consumes
+them as if valid. Attackers shape the heap first (notably via
+`session.upload_progress` + multipart parsing, which allocates predictably),
+then trigger the OOM at the right moment. Independent lab work measured ~52x
+memory amplification from duplicate 6-byte multipart headers (fixed 256-byte
+`SMART_STR_START_SIZE` per saved header), so small bodies defeat
+`post_max_size`-style size thinking; chunked framing additionally bypassed the
+Content-Length pre-check on unpatched builds. Both closed in the patch.
+
+**619 — stale worker state.** Request-owned globals are freed at request end
+but a pointer survives; the *next* request on the same worker dereferences it.
+Reliable pairing needs a persistent worker (FPM `pm.static max_children=1` in
+labs; prefork single-worker for mod_php) plus attacker-influenced session
+decoding in the window. Lab-verified as a crash primitive on FPM; full RCE
+chains demonstrated on stock `php:8.5.11-apache` with in-band disclosure
+(`PS(id)`→cookie leak) across repeated ASLR layouts.
+
+## 3. Why `session.upload_progress` keeps appearing
+
+It is the heap-shaping primitive, not the bug itself: attacker-controlled
+multipart field names/values are stored into session data pre-RINIT, giving a
+remote party predictable allocations + a readable/writable session file. The
+upload-progress *injection* (attacker key stored verbatim) survives even the
+8.5.12 patch per lab analysis — but without the OOM/stale-state bugs behind it
+it is not RCE by itself. Defense-in-depth still says disable it if unused
+(`session.upload_progress.enabled=0`) — it shrinks the primitive surface, but
+**it is not a fix**.
+
+## 4. How detection works (what this scanner uses)
+
+Two independent layers; either can fire, both together = highest confidence.
+
+### Layer A — version fingerprint (passive, zero-risk)
+`X-Powered-By: PHP/x.y.z` / `Server: ... PHP/x.y.z` / exposed `phpinfo()`.
+Compare against the advisory table:
+
+| Branch | Fixed in | Verdict if below |
+|---|---|---|
+| 8.5 | 8.5.12 | LIKELY_VULNERABLE |
+| 8.4 | 8.4.27 | LIKELY_VULNERABLE |
+| 8.3 | 8.3.36 | LIKELY_VULNERABLE |
+| 8.2 | 8.2.35 | LIKELY_VULNERABLE |
+| ≤ 8.1 | EOL, no upstream fix | EOL_VULNERABLE (check distro backport) |
+
+Caveats handled: branch-only disclosure (`PHP/8.1`, no patch) → downgrade to
+EOL/UNKNOWN, never hard-vulnerable; distro suffix (`+deb12u1`, `Ubuntu`,
+`.el9`) → keep PATCHED verdict but medium confidence + changelog advice;
+future branches (> 8.5) → UNKNOWN, not vulnerable.
+
+### Layer B — session-write warning oracle (active, benign)
+Single ~300-byte multipart POST with `Cookie: PHPSESSID=_` (invalid id) plus a
+`PHP_SESSION_UPLOAD_PROGRESS` field. Unpatched builds print **all three**
+warnings (needs `display_errors=On` and the request reaching the PHP handler):
+
+1. `Session ID is too long or contains illegal characters`
+2. `Failed to read session data`
+3. `Failed to write session data (`
+
+The 2026-10-21 fix removed the session-write warning path, so **patched builds
+print only #1–#2** (verified live: 8.5.11 → 3/3, 8.5.12 → 2/3). Requiring all
+three (not a substring of one) is what makes false positives ~zero: the exact
+triple is emitted only by the unpatched session startup path. No OOM, no UAF,
+no code execution — it only observes error output. Credit: PortSwigger
+BCheck/active check by Tom SL; behavior confirmed against live Docker
+`php:8.5.11-apache` vs `php:8.5-apache` (8.5.12) in this repo's test lab.
+
+### What the scanner deliberately does NOT do
+No stalled-multipart triggers, no heap spray, no session-injection canaries,
+no worker-crash observation, no payload execution. Those are exploitation
+primitives (see murrez/dinosn/0x4148 PoCs) — out of scope by design.
+
+## 5. Hardening / mitigation notes (not fixes)
+
+- Real fix: upgrade to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (or vendor backport),
+  then **restart all PHP workers** (FPM pools, Apache).
+- Stopgaps until patched: `session.upload_progress.enabled=0`; gateway/WAF
+  rules blocking `PHP_SESSION_UPLOAD_PROGRESS` multipart fields — note the
+  comma-separator bypass (`Content-Type: multipart/form-data, boundary=X` is
+  accepted by PHP's SAPI parser, so anchor signatures carefully); request-size
+  limits (weak alone given 52x amplification); `display_errors=Off` (hides the
+  oracle, not the bug).
+- Detection: this scanner (external), plus server-side log watches for
+  multipart `upload_progress` bursts and worker crashes.
+
+## 6. Sources
+
+- PHP security advisories: GHSA-w8hw-w9fx-j79w (618), GHSA-6wmf-4rv5-p3rp (619);
+  PHP 2026 archive #2026-10-21-5 (fixed releases + `memory_limit` /
+  `post_max_size` / `fatal_error_backtraces` guidance).
+- NCSC-NL/php2shell — operational info repo (status, SAPI coverage, actions).
+- CERT-EU Security Advisory 2026-018.
+- PortSwigger BChecks `CVE-2026-109618_CVE-2026-109619-PHP2Shell-active.bcheck`
+  + passive version bcheck + bambda scan check (oracle design).
+- Sansec php2shell research (disclosure timeline, impact).
+- murrez/php2shell (`php2shell_core.py` — fingerprint/trigger/619-spray shapes).
+- dinosn/php-cve-2026-10961x-lab-poc (end-to-end RCE receipt, 52x amplification,
+  patch-gap analysis, FPM stale-state, WAF bypass).
+- 0x4148/CVE-2026-109618-php2shell-lab (Docker lab + PoC runner).
+- JoasASantos/php2shell-scanner (version-strategy reference).
+- ENISA CNW-2026-04 (EU CSIRT advisory list).

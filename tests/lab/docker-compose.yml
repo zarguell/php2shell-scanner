@@ -1,0 +1,51 @@
+version: "3.8"
+# php2shell scanner test lab — localhost published ports for the test runner.
+# Lab-only. Never expose publicly.
+services:
+  vuln-error-on:
+    image: php:8.5.11-apache
+    ports: ["19081:80"]
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"lab-ok \"; echo phpversion();' > /var/www/html/index.php
+      && docker-php-entrypoint apache2-foreground"
+  vuln-error-off:
+    image: php:8.5.11-apache
+    ports: ["19082:80"]
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"lab-ok\";' > /var/www/html/app.php
+      && rm -f /var/www/html/index.php
+      && printf '<html><body>welcome</body></html>' > /var/www/html/index.html
+      && docker-php-entrypoint apache2-foreground"
+  patched:
+    image: php:8.5-apache
+    ports: ["19083:80"]
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"lab-ok \"; echo phpversion();' > /var/www/html/index.php
+      && docker-php-entrypoint apache2-foreground"
+  eol-old:
+    image: php:8.3.6-apache
+    ports: ["19084:80"]
+    command: >
+      bash -c "echo 'display_errors=On\nexpose_php=On' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"lab-ok \"; echo phpversion();' > /var/www/html/index.php
+      && docker-php-entrypoint apache2-foreground"
+  notphp:
+    image: nginx:alpine
+    ports: ["19085:80"]
+  static-only:
+    image: php:8.5.11-apache
+    ports: ["19086:80"]
+    command: >
+      bash -c "printf '<html><body>static</body></html>' > /var/www/html/index.html
+      && rm -f /var/www/html/index.php
+      && docker-php-entrypoint apache2-foreground"
+  upload-disabled:
+    image: php:8.5.11-apache
+    ports: ["19087:80"]
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=0' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"lab-ok \"; echo phpversion();' > /var/www/html/index.php
+      && docker-php-entrypoint apache2-foreground"
