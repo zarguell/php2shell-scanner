@@ -83,9 +83,13 @@ BARE_VER_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 
 
 def parse_version(text: str) -> tuple[int, int, int] | None:
+    """Parse a PHP version ONLY when a PHP token is present (headers).
+    The token requirement is deliberate: bare numbers in Server/X-Powered-By
+    (Tomcat/8.5.98, Servlet/5.0, WordPress 6.8.3) are NOT PHP versions and
+    must never classify. Use parse_strict_version for normalized "x.y[.z]"."""
     if not text:
         return None
-    m = VER_RE.search(text) or BARE_VER_RE.search(text)
+    m = VER_RE.search(text)
     if not m:
         return None
     major, minor = int(m.group(1)), int(m.group(2))
@@ -95,6 +99,20 @@ def parse_version(text: str) -> tuple[int, int, int] | None:
     return (major, minor, patch)
 
 
+def parse_strict_version(text: str) -> tuple[int, int, int] | None:
+    """Parse normalized 'x.y' / 'x.y.z' built by OUR fingerprint layer only
+    (never raw header/body text). Callers MUST have established PHP context
+    (PHP token header, X-Powered-By PHP/..., phpinfo body match)."""
+    if not text:
+        return None
+    m = BARE_VER_RE.fullmatch(text.strip())
+    if not m:
+        return None
+    major, minor = int(m.group(1)), int(m.group(2))
+    patch = int(m.group(3)) if m.group(3) is not None else 0
+    if major < 4 or major > 8 or (major == 8 and minor > 9) or (major == 7 and minor > 4):
+        return None
+    return (major, minor, patch)
 def version_has_patch(text: str) -> bool:
     m = VER_RE.search(text or "")
     return bool(m and m.group(3) is not None)
@@ -164,20 +182,28 @@ def http_request(opener, url: str, timeout: float, method="GET",
         return {"status": None, "error": f"{type(e).__name__}: {e}", "url": url}
 
 
-def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str]]:
-    """Return (version, source, php_signals)."""
+def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], bool]:
+    """Return (version, source, php_signals, branch_only). branch_only=True when
+    a PHP token disclosed only x.y (no patch) — classify() must not fabricate
+    x.y.0, so scan_endpoint maps it to EOL_VULNERABLE/UNKNOWN explicitly."""
     signals: list[str] = []
     version, source = None, None
+    branch_only = False
     for key in ("x-powered-by", "server", "x-php-version", "x-generator"):
         val = next((v for k, v in res.get("headers", {}).items() if k.lower() == key), None)
         if not val:
+            continue
+        # Gate: the value itself must name PHP (kills Tomcat/8.5.98, Servlet/5.0,
+        # X-AspNet-Version style false hits on the Server header).
+        if not re.search(r"php", val, re.I):
             continue
         v = parse_version(val)
         if v:
             version = f"{v[0]}.{v[1]}.{v[2]}"
             source = f"header:{key}"
-        elif re.search(r"php", val, re.I):
-            signals.append(f"header:{key}={val[:80]}")
+            branch_only = not version_has_patch(val)
+            break
+        signals.append(f"header:{key}={val[:80]}")
     set_cookie = next((v for k, v in res.get("headers", {}).items()
                        if k.lower() == "set-cookie"), "")
     if re.search(r"PHPSESSID", set_cookie, re.I):
@@ -188,13 +214,27 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str]]:
             signals.append("body:PHPSESSID")
         if re.search(r'\.php["\'\s>]', body):
             signals.append("body:.php-link")
+        if re.search(r"wp-content|wp-includes|/wp-json/|wordpress", body, re.I):
+            signals.append("body:wordpress")
+        if re.search(r"laravel|__laravel|csrf-token", body, re.I):
+            signals.append("body:laravel")
         m = PHPINFO_VER_RE.search(body)
         if m and version is None:
             version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
             source = "body:phpinfo"
         elif re.search(r"phpinfo\(\)|PHP Version", body):
             signals.append("body:phpinfo-marker")
-    return version, source, signals
+        # Bare "Powered by PHP x.y.z" style text: PHP context present, version
+        # extracted from a PHP-token match only.
+        if version is None:
+            pm = re.search(r"php[^0-9]{0,20}(\d+\.\d+(?:\.\d+)?)", body, re.I)
+            if pm:
+                pv = parse_version("PHP " + pm.group(1))
+                if pv:
+                    version = f"{pv[0]}.{pv[1]}.{pv[2]}"
+                    source = "body:powered-by"
+                    branch_only = "." not in pm.group(1).strip() or pm.group(1).count(".") == 1
+    return version, source, signals, branch_only
 
 
 ORACLE_PATHS = ("/", "/index.php")
@@ -246,7 +286,9 @@ class Finding:
     php_detected: bool = False
     php_version: str | None = None
     version_source: str | None = None
+    version_verdict: str = "UNKNOWN"
     version_detail: str = ""
+    version_branch_only: bool = False
     distro_suffix: bool = False
     oracle_ran: bool = False
     oracle_positive: bool = False
@@ -334,16 +376,29 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
             continue
         f.reachable = True
         f.http_status = res["status"]
-        ver, src, sigs = fingerprint_response(res)
+        ver, src, sigs, branch_only = fingerprint_response(res)
         f.signals.extend(sigs)
         if ver:
             f.php_detected = True
             f.php_version = ver
             f.version_source = src
+            f.version_branch_only = branch_only
             php_hdrs = " ".join(str(v) for k, v in res.get("headers", {}).items()
                                if k.lower() in ("x-powered-by", "server", "x-php-version") and re.search(r"php", str(v), re.I))
             f.distro_suffix = bool(DISTRO_RE.search(php_hdrs))
-            f.version_verdict, f.version_detail = classify_version(parse_version(ver), ver)
+            if branch_only:
+                major, minor = int(ver.split(".")[0]), int(ver.split(".")[1])
+                if (major, minor) in FIXED:
+                    f.version_verdict = "LIKELY_VULNERABLE"
+                    f.version_detail = (f"PHP {major}.{minor}.x (patch undisclosed) on supported branch — "
+                                        f"assume vulnerable until fixed {'.'.join(map(str, FIXED[(major, minor)]))} proven")
+                elif major < 8 or (major == 8 and minor < 2):
+                    f.version_verdict = "EOL_VULNERABLE"
+                    f.version_detail = f"PHP {major}.{minor}.x is EOL (< 8.2); no upstream fix"
+                else:
+                    f.version_verdict, f.version_detail = classify_version(parse_strict_version(ver), ver)
+            else:
+                f.version_verdict, f.version_detail = classify_version(parse_strict_version(ver), ver)
         elif sigs:
             f.php_detected = True
         if phpinfo and not ver:
@@ -356,7 +411,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                         f.php_version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
                         f.version_source = f"phpinfo:{p}"
                         f.version_verdict, f.version_detail = classify_version(
-                            parse_version(f.php_version))
+                            parse_strict_version(f.php_version))
                         f.signals.append(f"phpinfo:{p}")
                         break
         if do_oracle:

@@ -32,7 +32,8 @@ class TestVersions(unittest.TestCase):
     def test_parse_full(self):
         self.assertEqual(S.parse_version("PHP/8.5.11"), (8, 5, 11))
         self.assertEqual(S.parse_version("PHP 8.3.6"), (8, 3, 6))
-        self.assertEqual(S.parse_version("8.5.12"), (8, 5, 12))  # bare re-parse
+        # strict parser is for OUR normalized strings only (PHP context proven)
+        self.assertEqual(S.parse_strict_version("8.5.12"), (8, 5, 12))
 
     def test_parse_branch_only(self):
         self.assertEqual(S.parse_version("PHP/8.1"), (8, 1, 0))
@@ -43,6 +44,10 @@ class TestVersions(unittest.TestCase):
         self.assertIsNone(S.parse_version("Apache/2.4.69 (Debian)"))
         self.assertIsNone(S.parse_version(""))
         self.assertIsNone(S.parse_version("PHP/9.9.9"))
+        # token gate: bare numbers are NOT php versions at parse layer
+        self.assertIsNone(S.parse_version("8.5.12"))
+        self.assertIsNone(S.parse_version("Apache Tomcat/8.5.98"))
+        self.assertIsNone(S.parse_version("WordPress 6.8.3"))
 
     def test_classify_boundaries(self):
         for branch, fixed in S.FIXED.items():
@@ -58,20 +63,57 @@ class TestVersions(unittest.TestCase):
         self.assertEqual(S.classify_version(None, "")[0], "UNKNOWN")
 
     def test_distro_regex_scoped(self):
-        # DISTRO_RE matches distro tokens; scan_endpoint scopes it to
-        # PHP-bearing header values only, so plain "Apache (Debian)" is
-        # excluded at the call site. Live test below proves end state.
         self.assertFalse(S.DISTRO_RE.search("PHP/8.5.12"))
         self.assertTrue(S.DISTRO_RE.search("PHP/8.5.12 Ubuntu"))
         self.assertTrue(S.DISTRO_RE.search("8.5.11-1+deb12u1"))
 
-    def test_distro_not_set_for_stock_docker(self):
-        if not LIVE:
-            self.skipTest("needs live lab")
-        op = S.make_opener(10, False)
-        res = S.http_request(op, "http://127.0.0.1:19083/", 10)
-        ver, _, _ = S.fingerprint_response(res)
-        self.assertEqual(ver, "8.5.12")
+
+class TestFingerprint(unittest.TestCase):
+    """Pressure battery: every fingerprint the server may leak."""
+    def fp(self, headers=None, body=""):
+        return S.fingerprint_response({"headers": headers or {}, "body": body})
+
+    def test_x_powered_by_full(self):
+        ver, src, _, bo = self.fp({"X-Powered-By": "PHP/8.5.11"})
+        self.assertEqual((ver, src, bo), ("8.5.11", "header:x-powered-by", False))
+
+    def test_server_header_embedded(self):
+        ver, src, _, _ = self.fp({"Server": "Apache/2.4.58 (Unix) PHP/8.2.20"})
+        self.assertEqual((ver, src), ("8.2.20", "header:server"))
+
+    def test_branch_only_flagged(self):
+        ver, _, _, bo = self.fp({"X-Powered-By": "PHP/8.1"})
+        self.assertEqual(ver, "8.1.0")
+        self.assertTrue(bo)
+
+    def test_tomcat_not_php(self):
+        ver, _, sigs, _ = self.fp({"Server": "Apache Tomcat/8.5.98"})
+        self.assertIsNone(ver)
+        self.assertEqual(sigs, [])
+
+    def test_servlet_generator_ignored(self):
+        self.assertIsNone(self.fp({"X-Powered-By": "Servlet/5.0"})[0])
+        self.assertIsNone(self.fp({"X-Generator": "WordPress 6.8.3"})[0])
+
+    def test_aspnet_ignored(self):
+        self.assertIsNone(self.fp({"X-Powered-By": "ASP.NET", "X-AspNet-Version": "4.0.30319"})[0])
+
+    def test_body_powered_by(self):
+        ver, src, _, _ = self.fp(body="<html>Powered by PHP 8.2.12</html>")
+        self.assertEqual((ver, src), ("8.2.12", "body:powered-by"))
+
+    def test_body_bare_number_ignored(self):
+        self.assertIsNone(self.fp(body="Tomcat 8.5.98 status page")[0])
+
+    def test_framework_signals(self):
+        _, _, sigs, _ = self.fp({"Server": "nginx"}, '<a href="i.php">x</a>')
+        self.assertIn("body:.php-link", sigs)
+        _, _, sigs, _ = self.fp(body='<script src="/wp-includes/x.js">')
+        self.assertIn("body:wordpress", sigs)
+        _, _, sigs, _ = self.fp(body='<input name="_token" data-csrf-token>')
+        self.assertIn("body:laravel", sigs)
+
+
 class TestOracleBody(unittest.TestCase):
     def test_body_shape(self):
         body = S.build_oracle_body("----BOUND", "TOKEN123", "f.txt")
