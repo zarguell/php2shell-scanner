@@ -1052,6 +1052,32 @@ def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
     return raw, target_id
 
 
+def cdp_ws_page_socket(host: str, port: int, target_id: str, timeout: float,
+                       token: str = "") -> socket.socket:
+    """Raw websocket to an EXISTING page target (/devtools/page/<target_id>).
+    No HTTP leg, no new tab — dials the known path directly. Used by
+    cdp_scoped_driver after the browser-session attach."""
+    import base64 as _b64p
+    from urllib.parse import quote as _q
+    _path = "/devtools/page/" + _q(target_id, safe="")
+    _raw = socket.create_connection((host, port), timeout=timeout)
+    _raw.settimeout(timeout)
+    _key = _b64p.b64encode(bytes(__import__("os").urandom(16))).decode()
+    _auth = f"Authorization: Bearer {token}\r\n" if token else ""
+    _raw.sendall(f"GET {_path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {_key}\r\n"
+                  f"Sec-WebSocket-Version: 13\r\n{_auth}\r\n".encode())
+    _head = b""
+    while b"\r\n\r\n" not in _head:
+        _chunk = _raw.recv(4096)
+        if not _chunk:
+            raise ConnectionError("CDP page handshake: connection closed")
+        _head += _chunk
+    if b" 101 " not in _head.split(b"\r\n", 1)[0]:
+        raise ConnectionError(f"CDP page handshake rejected: {_head[:80]!r}")
+    return _raw
+
+
 def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
                         ) -> tuple[socket.socket, object]:
     """Browser-level CDP session (/json/version -> /devtools/browser/...).
@@ -1103,6 +1129,83 @@ def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
         return cdp_send(_raw, {"id": _mid[0], "method": method,
                                "params": params or {}}, timeout)
     return _raw, _call
+
+
+def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
+                      token: str = "") -> tuple[socket.socket, socket.socket, object, str]:
+    """One correctly-scoped driver for a page target. Returns
+    (page_sock, browser_sock, call, sessionId) where call(method, params) sends
+    Page/Runtime/Network methods session-scoped over the page socket.
+    Strict builds route Target.* ONLY on the browser session and Page.* ONLY
+    with the attach sessionId; lenient builds accept either, so this shape
+    works everywhere. attach runs over the browser session with a 5s deadline
+    (never the full timeout); on attach failure sessionId is "" and calls go
+    sessionless (lenient-build behavior). Caller closes BOTH sockets."""
+    import http.client as _hc3
+    import json as _js3
+    from urllib.parse import urlparse as _up3
+    _c = _hc3.HTTPConnection(host, port, timeout=timeout)
+    _hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+    _c.request("GET", "/json/version", headers=_hdrs)
+    _r = _c.getresponse()
+    if _r.status != 200:
+        try:
+            _c.close()
+        except Exception:
+            pass
+        raise ConnectionError(f"CDP /json/version -> HTTP {_r.status}")
+    _ws = _js3.loads(_r.read().decode("utf-8", "replace")).get("webSocketDebuggerUrl", "")
+    try:
+        _c.close()
+    except Exception:
+        pass
+    if not _ws:
+        raise ConnectionError("CDP /json/version returned no webSocketDebuggerUrl")
+    _u = _up3(_ws)
+    _bpath = _u.path + (("?" + _u.query) if _u.query else "")
+    import base64 as _b64c
+    _bsock = socket.create_connection((host, _u.port or port), timeout=timeout)
+    _bsock.settimeout(timeout)
+    _bkey = _b64c.b64encode(bytes(__import__("os").urandom(16))).decode()
+    _bauth = f"Authorization: Bearer {token}\r\n" if token else ""
+    _bsock.sendall(f"GET {_bpath} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\nSec-WebSocket-Key: {_bkey}\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n{_bauth}\r\n".encode())
+    _bhead = b""
+    while b"\r\n\r\n" not in _bhead:
+        _chunk = _bsock.recv(4096)
+        if not _chunk:
+            raise ConnectionError("CDP browser handshake: connection closed")
+        _bhead += _chunk
+    if b" 101 " not in _bhead.split(b"\r\n", 1)[0]:
+        raise ConnectionError(f"CDP browser handshake rejected: {_bhead[:80]!r}")
+    _bmid = [0]
+
+    def _bcall(method: str, params: dict | None = None) -> dict:
+        _bmid[0] += 1
+        return cdp_send(_bsock, {"id": _bmid[0], "method": method,
+                                 "params": params or {}}, timeout)
+    _sid = ""
+    try:
+        _bmid[0] += 1
+        _ar = cdp_send(_bsock, {"id": _bmid[0],
+                                "method": "Target.attachToTarget",
+                                "params": {"targetId": target_id, "flatten": True}},
+                       timeout, call_timeout=min(5.0, timeout))
+        _sid = _ar.get("result", {}).get("sessionId", "")
+    except Exception as _e:
+        trace(2, f"cdp attach skipped ({type(_e).__name__}: {str(_e)[:100]}), sessionless mode")
+    _psock = cdp_ws_page_socket(host, port, target_id, timeout, token)
+    _pmid = [0]
+
+    def _call(method: str, params: dict | None = None) -> dict:
+        _pmid[0] += 1
+        _p = dict(params or {})
+        if _sid:
+            _p["sessionId"] = _sid
+        return cdp_send(_psock, {"id": _pmid[0], "method": method,
+                                 "params": _p}, timeout)
+    return _psock, _bsock, _call, _sid
 
 
 def cdp_send(sock: socket.socket, payload: dict, timeout: float,
@@ -1218,13 +1321,10 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
     sock, target_id = cdp_ws_connect(host, port, timeout, token)
+    _psock = _bsock = None
     try:
-        mid = [0]
-
-        def call(method: str, params: dict | None = None) -> dict:
-            mid[0] += 1
-            return cdp_send(sock, {"id": mid[0], "method": method,
-                                   "params": params or {}}, timeout)
+        _psock, _bsock, call, _sess = cdp_scoped_driver(
+            host, port, target_id, timeout, token)
         call("Page.enable")
         call("Runtime.enable")
         call("Page.navigate", {"url": page_url})
@@ -1259,15 +1359,12 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
             urls = []
         return html, [u for u in urls if isinstance(u, str)][:50]
     finally:
-        try:
-            cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
-                            "params": {"targetId": target_id}}, 5.0)
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
+        for _s in (sock, _psock, _bsock):
+            try:
+                if _s is not None:
+                    _s.close()
+            except Exception:
+                pass
 
 
 def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
@@ -1282,8 +1379,10 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
     sock, target_id = cdp_ws_connect(host, port, timeout, token)
+    _psock = _bsock = None
     try:
-        _sid, call = cdp_session(sock, target_id, timeout)
+        _psock, _bsock, call, _sess = cdp_scoped_driver(
+            host, port, target_id, timeout, token)
         call("Page.enable")
         call("Runtime.enable")
         call("Network.enable")
@@ -1348,15 +1447,12 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
                 continue
         return html, res_urls, clicks, forms
     finally:
-        try:
-            cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
-                            "params": {"targetId": target_id}}, 5.0)
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
+        for _s in (sock, _psock, _bsock):
+            try:
+                if _s is not None:
+                    _s.close()
+            except Exception:
+                pass
 
 
 def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
@@ -1399,76 +1495,73 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
     except ConnectionError as e:
         step("HTTP leg (/json/new)", False, str(e)[:160])
         return 1
-    # NOTE: Target.* belongs on the BROWSER session, not the page session.
-    # Page-session getTargets hangs silently on strict builds (observed);
-    # browser-session answers everywhere. Fall back page->browser on hang.
-    _r, _n, _how = None, -1, ""
-    call = None
-    _sid = ""
+    # Strict builds route Target.* ONLY on the browser session and Page.*
+    # ONLY with the browser-session attach sessionId; lenient builds accept
+    # either shape. Same scoped driver as real scans — the doctor proves the
+    # exact path scans will use.
+    _psock = _bsock = None
     try:
-        _sid, _pcall = cdp_session(sock, target_id, timeout)
-        call = _pcall
-        _r = _pcall("Target.getTargets")
+        _bsock, _bcall = cdp_browser_session(host, port, timeout, token)
         try:
-            _n = len(_r["result"]["targetInfos"])
-        except (KeyError, TypeError):
-            pass
-        _how = "page session"
-    except Exception:
-        _r = None
-    if _r is None or _n == -1:
-        try:
-            _bsock, _bcall = cdp_browser_session(host, port, timeout, token)
+            _br = _bcall("Target.getTargets")
             try:
-                _br = _bcall("Target.getTargets")
-                try:
-                    _n = len(_br["result"]["targetInfos"])
-                except (KeyError, TypeError):
-                    pass
-                _how = "browser session (page session hung — strict build)"
-            finally:
-                try:
-                    _bsock.close()
-                except Exception:
-                    pass
+                _n = len(_br["result"]["targetInfos"])
+            except (KeyError, TypeError):
+                _n = -1
         except Exception as e:
             step("protocol round-trip (Target.getTargets)", False,
                  f"{type(e).__name__}: {str(e)[:160]}")
-            say("HINT: handshake + HTTP leg work but protocol hangs on BOTH page "
-                "and browser sessions — a proxy/VPN between scanner and browser "
+            say("HINT: handshake + HTTP leg work but Target.getTargets hangs on "
+                "the browser session — a proxy/VPN between scanner and browser "
                 "is eating websocket frames. Try --cdp 127.0.0.1:9222 on the SAME "
                 "host as the browser first.")
+            return 1
+        if _n == -1:
+            step("protocol round-trip (Target.getTargets)", False,
+                 "reply had no targetInfos")
+            return 1
+        step("protocol round-trip (Target.getTargets)", True, f"{_n} target(s) via browser session")
+        try:
+            _psock, _bsock2, call, _sess = cdp_scoped_driver(
+                host, port, target_id, timeout, token)
             try:
-                sock.close()
+                _bsock.close()
             except Exception:
                 pass
+            _bsock = _bsock2
+            if not _sess:
+                step("tab navigate+close", False,
+                     "attach returned no sessionId (strict build needs one)")
+                say("HINT: Target.getTargets works but attachToTarget yields no "
+                    "session — this build scopes tabs in a way the scanner cannot "
+                    "drive. Plain-HTTP spider still runs; --crawl-full is unavailable.")
+                return 1
+            call("Page.enable")
+        except Exception as e:
+            step("tab navigate+close", False, f"{type(e).__name__}: {str(e)[:160]}")
+            say("HINT: attach or Page.enable hung — the tab is not drivable with "
+                "a sessionId on this build. Plain-HTTP spider still runs; "
+                "--crawl-full is unavailable.")
             return 1
-    step("protocol round-trip (Target.getTargets)", True, f"{_n} target(s) via {_how}")
-    try:
-        call("Page.enable")
-        call("Page.navigate", {"url": "about:blank"})
-        import time as _t
-        _t.sleep(1.0)
-        step("tab navigate+close", True, "about:blank loaded")
-    except Exception as e:
-        step("tab navigate+close", False, f"{type(e).__name__}: {str(e)[:160]}")
-        say("HINT: protocol works but navigate hangs — the BROWSER's network "
-            "(not the scanner's) can't reach the URL: browser-side proxy/DNS, "
-            "or a headless firewall. Test navigate to http://127.0.0.1/ first.")
         try:
-            sock.close()
-        except Exception:
-            pass
-        return 1
-    try:
-        cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
-                        "params": {"targetId": target_id}}, 5.0)
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+            call("Page.navigate", {"url": "about:blank"})
+            import time as _t
+            _t.sleep(1.0)
+            step("tab navigate+close", True,
+                 f"about:blank loaded (session {_sess[:8]}…)")
+        except Exception as e:
+            step("tab navigate+close", False, f"{type(e).__name__}: {str(e)[:160]}")
+            say("HINT: Page.enable works but navigate hangs — the BROWSER's network "
+                "(not the scanner's) can't reach the URL: browser-side proxy/DNS, "
+                "or a headless firewall. Test navigate to http://127.0.0.1/ first.")
+            return 1
+    finally:
+        for _s in (sock, _psock, _bsock):
+            try:
+                if _s is not None:
+                    _s.close()
+            except Exception:
+                pass
     step("done", True, "CDP endpoint healthy — --cdp scans will use it")
     return 0
 

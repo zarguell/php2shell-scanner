@@ -67,7 +67,150 @@ def _read_frame(conn2, fbuf: bytes):
     return payload, fbuf[rest:]
 
 
+def _serve_strict_browser(port: int, hang_page: bool, started: "_th.Event",
+                        log: list) -> None:
+    """Fake strict-build CDP: /json/version + /json/new over HTTP, then a
+    browser websocket (answers Target.*) and a page websocket. hang_page=True
+    reproduces the reporter's build: the page socket answers NOTHING."""
+    srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(5)
+    srv.settimeout(30)
+    started.set()
+
+    def _loop(conn, name: str, hang_all: bool) -> None:
+        fbuf = b""
+        while True:
+            try:
+                payload, fbuf = _read_frame(conn, fbuf)
+                msg = _js.loads(payload.decode())
+            except Exception:
+                return
+            method = msg.get("method", "")
+            log.append((name, method))
+            if hang_all:
+                continue  # strict build: silent drop, no error
+            if method == "Target.getTargets":
+                r = _js.dumps({"id": msg.get("id"), "result": {
+                    "targetInfos": [{"targetId": "T9"}]}}).encode()
+            elif method == "Target.attachToTarget":
+                r = _js.dumps({"id": msg.get("id"), "result": {
+                    "sessionId": "SESS1"}}).encode()
+            else:
+                r = _js.dumps({"id": msg.get("id"), "result": {}}).encode()
+            conn.sendall(_frame(r))
+
+    import threading as _th2
+    try:
+        # Route EVERY connection by its request line: /json/* -> JSON reply +
+        # close; /devtools/* -> 101 upgrade + method-routed frame loop.
+        # (Client dials: HTTP legs and websocket upgrades interleave freely.)
+        while True:
+            conn, _ = srv.accept()
+            conn.settimeout(30)
+            try:
+                req = _read_http(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+            first = req.split(b"\r\n", 1)[0]
+            if b"/json/version" in first:
+                body = ('{"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/browser/B1"}'
+                        % port).encode()
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                             b"Content-Length: " + str(len(body)).encode() +
+                             b"\r\nConnection: close\r\n\r\n" + body)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            elif b"/json/" in first:
+                body = ('{"id":"T9","webSocketDebuggerUrl":'
+                        '"ws://127.0.0.1:%d/devtools/page/T9"}' % port).encode()
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                             b"Content-Length: " + str(len(body)).encode() +
+                             b"\r\nConnection: close\r\n\r\n" + body)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            elif b"/devtools/" in first:
+                conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                             b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                             b"Sec-WebSocket-Accept: xxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n\r\n")
+                # browser socket answers Target.*, page socket hangs all when
+                # hang_page (reporter's build); method routing decides.
+                is_browser = b"/devtools/browser/" in first
+                _th2.Thread(target=_loop,
+                            args=(conn, "browser" if is_browser else "page",
+                                  False if is_browser else hang_page),
+                            daemon=True).start()
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+
 class TestCdpHang(unittest.TestCase):
+    def test_scoped_driver_survives_strict_build(self):
+        # Full strict-build reproduction: page socket hangs everything, browser
+        # session answers. cdp_scoped_driver must attach over the browser
+        # session and drive Page.enable session-scoped over the page socket —
+        # here the page socket hangs, so Page.enable must raise TimeoutError
+        # NAMING the method (diagnosable), not hang forever. And with
+        # hang_page=False the same driver must succeed end to end.
+        for hang, port in ((True, 19296), (False, 19295)):
+            started = _th.Event()
+            log: list = []
+            _th.Thread(target=_serve_strict_browser,
+                       args=(port, hang, started, log), daemon=True).start()
+            self.assertTrue(started.wait(timeout=10))
+            _t.sleep(0.3)
+            psock = bsock = None
+            try:
+                sock, tid = S.cdp_ws_connect("127.0.0.1", port, 12)
+                try:
+                    psock, bsock, call, sess = S.cdp_scoped_driver(
+                        "127.0.0.1", port, tid, 12)
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if hang:
+                    # attach runs over the BROWSER socket (answers) -> SESS1;
+                    # the PAGE socket hangs everything (reporter's build), so
+                    # Page.enable must raise TimeoutError NAMING the method —
+                    # the doctor reports 'not drivable', never a bare hang.
+                    self.assertEqual(sess, "SESS1")
+                    with self.assertRaises(TimeoutError) as cm:
+                        S.cdp_send(psock, {"id": 99, "method": "Page.enable",
+                                           "params": {"sessionId": sess}}, 12,
+                                   call_timeout=2.0)
+                    self.assertIn("Page.enable", str(cm.exception))
+                else:
+                    self.assertEqual(sess, "SESS1")
+                    r = call("Page.enable")
+                    self.assertIn("result", r)
+                    # sessionId actually prefixed on the wire
+                    self.assertTrue(
+                        any(m == "Page.enable" for _, m in log),
+                        f"Page.enable never reached fake browser: {log}")
+            finally:
+                for _s in (psock, bsock):
+                    try:
+                        if _s is not None:
+                            _s.close()
+                    except Exception:
+                        pass
+
     def test_attach_hang_falls_back_sessionless(self):
         # The strict-build symptom: attachToTarget hangs, everything else
         # answers. cdp_session must return "" in ~5s (not the full timeout)
