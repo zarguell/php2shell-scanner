@@ -33,6 +33,7 @@ LAB = {  # service -> (port, expected_verdict)
     "appliance-vuln": (19095, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.70 extracted
     "appliance-fixed": (19096, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.81 extracted
     "deep-surface": (19097, "VULNERABLE"),  # spider-only find: PHP 2 clicks down, oracle via /portal/home.php
+    "js-spa": (19100, "VULNERABLE"),  # JS-bundle-only endpoints (?action handler), oracle via /api/v2/endpoint.php
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -355,6 +356,21 @@ class TestLiveLab(unittest.TestCase):
         self.assertEqual(f.verdict, "VULNERABLE", f.detail)
         self.assertTrue(f.oracle_positive, f.oracle_evidence)
         self.assertIn("8.5.11", f.php_version or "")
+
+    def test_js_spa_bundle_only_endpoints(self):
+        # index.html has ZERO .php refs; endpoints live in /static/app.js.
+        # Bundle fetching must find them, ?action dynamic test must prove,
+        # oracle must fire — without any browser.
+        op = self.opener
+        base = "http://127.0.0.1:19100/"
+        self.assertEqual(S.harvest_php_links(op, base, 10), [])
+        tgts, visited = S.spider_site(op, base, 10)
+        self.assertIn("/api/v2/endpoint.php", tgts)
+        self.assertIn("/portal/deep.php", tgts)
+        self.assertIn("/static/app.js", visited)
+        f = self._scan(19100)
+        self.assertEqual(f.verdict, "VULNERABLE", f.detail)
+        self.assertIn("/api/v2/endpoint.php", f.oracle_evidence)
 
     def test_404_differential(self):
         # FPM proxy parses .php differently from static 404s; nginx alone doesn't

@@ -432,22 +432,29 @@ def discover_php_paths(opener, url: str, timeout: float,
                 continue
             if res.get("status") == 200 and p.endswith(".php"):
                 body1 = res.get("body") or ""
-                # two dynamic probes: bare random param AND common 'q' param
-                # (many search/app endpoints read ?q= / ?s= / ?id= but ignore
-                # unknown params — output only changes with a consumed name)
+                # dynamic probes: bare random param, common consumed names
+                # (?q/?s/?id/?action/?page/?p — endpoints ignore unknown params
+                # but output changes with a consumed one), reflection first.
                 r2 = http_request(opener, target + f"?{probe_token}=1", timeout)
                 body2 = r2.get("body") or ""
                 if r2.get("status") == 200 and probe_token in body2:
                     found.append(p)  # reflected token → code executed
+                    trace(1, f"discover {base}{p}: PHP-PROVEN (query reflection)")
                     continue
                 if body2 != body1:
                     found.append(p)  # query changed output → dynamic handler
+                    trace(1, f"discover {base}{p}: PHP-PROVEN (dynamic output)")
                     continue
-                r3 = http_request(opener, target + f"?q={probe_token}", timeout)
-                body3 = r3.get("body") or ""
-                if r3.get("status") == 200 and (probe_token in body3 or body3 != body1):
-                    found.append(p)  # consumed ?q= → dynamic handler
+                for qn in ("q", "s", "id", "action", "page", "p"):
+                    r3 = http_request(opener, target + f"?{qn}={probe_token}", timeout)
+                    body3 = r3.get("body") or ""
+                    if r3.get("status") == 200 and (probe_token in body3 or body3 != body1):
+                        found.append(p)  # consumed ?qn= → dynamic handler
+                        trace(1, f"discover {base}{p}: PHP-PROVEN (?{qn}= dynamic)")
+                        break
+                else:
                     continue
+                continue
         except Exception:
             continue
     # / always tried (oracle is harmless); discovered .php paths added
@@ -722,13 +729,17 @@ def harvest_php_links(opener, url: str, timeout: float,
 
 
 def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
-                max_depth: int = 2) -> tuple[set[str], set[str]]:
+                max_depth: int = 2, js_bundles: int = 3) -> tuple[set[str], set[str]]:
     """Bounded BFS crawl for PHP surface. Returns (php_targets, visited).
     Seeds at `/`; follows same-origin HTML links (any href, not just .php)
     to `max_depth`; every visited page contributes extract_links() hits.
-    Budget: 1 + pages visited (cap max_pages), all plain GETs, same host,
-    non-HTML content-types not followed, logout/logoff links skipped.
-    This is what finds PHP two clicks down a static front."""
+    Plus: up to js_bundles referenced same-origin `.js` files per site are
+    fetched and parsed for endpoint literals (this is the no-browser answer
+    to JS-rendered apps — endpoint NAMES live in bundle source text; a
+    headless browser would only re-derive what regex already reads, at 10-50x
+    the cost plus a 300MB dependency).
+    Budget: pages visited (cap max_pages) + ≤js_bundles bundle fetches,
+    all plain GETs, same host, non-HTML not followed, logout links skipped."""
     from urllib.parse import urljoin, urlparse
     base = url.rstrip("/")
     host = urlparse(base).hostname or ""
@@ -736,6 +747,8 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
     visited: set[str] = set()
     queue: list[tuple[str, int]] = [("/", 0)]
     HREF_RX = re.compile(r'''href\s*=\s*["']([^"'#>]+)["']''', re.I)
+    JS_SRC_RX = re.compile(r'''<script[^>]+src\s*=\s*["']([^"'#>]+?\.js)\b''', re.I)
+    js_fetched = 0
     pages = 0
     while queue and pages < max_pages:
         path, depth = queue.pop(0)
@@ -755,12 +768,41 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
         trace(1, f"spider {base}{path} d={depth} {res.get('status')} "
                   f"({len(body)}B) +{len(new_targets)}php "
                   f"{sorted(new_targets) if new_targets else ''}")
-        # missing content-type on a non-empty text body: treat as followable
-        # (extensionless static files often serve without ctype; the dynamic
-        # test later decides per-path — following is harmless, all plain GETs)
-        looks_html = ("html" in ctype or (not ctype and body.strip().startswith("<")))
-        if depth >= max_depth or not looks_html:
-            continue
+        # JS bundles: fetch up to js_bundles same-origin .js files site-wide
+        # and parse for endpoint literals (Vue/Angular/React apps ship their
+        # API map in bundle source — no browser needed to read it).
+        if js_fetched < js_bundles and "html" in ctype:
+            for jm in JS_SRC_RX.finditer(body):
+                if js_fetched >= js_bundles:
+                    break
+                src = jm.group(1).split("?")[0].strip()
+                if not src or src.startswith(("http", "//", "data:")):
+                    if src.startswith("http"):
+                        try:
+                            u = urlparse(src)
+                            if u.hostname != host:
+                                continue
+                            src = u.path or ""
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                if not src or len(src) >= 128 or src in visited:
+                    continue
+                try:
+                    jr = http_request(opener, base + src, timeout)
+                    visited.add(src)
+                    js_fetched += 1
+                except Exception:
+                    continue
+                jbody = jr.get("body") or ""
+                # cap parse at 2MB (bundles can be huge; endpoints are early)
+                for t in extract_links(jbody[:2_000_000]):
+                    if t not in php_targets:
+                        new_targets.add(t)
+                        php_targets.add(t)
+                trace(1, f"spider-js {base}{src} ({len(jbody)}B) "
+                          f"+{len(new_targets)}php total={len(php_targets)}")
         for m in HREF_RX.finditer(body):
             href = m.group(1).split("?")[0].split("#")[0].strip()
             if not href or href.startswith(("http", "//", "javascript:", "data:",
