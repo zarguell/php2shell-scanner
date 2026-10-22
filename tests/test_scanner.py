@@ -146,6 +146,18 @@ class TestFingerprint(unittest.TestCase):
     def fp(self, headers=None, body=""):
         return S.fingerprint_response({"headers": headers or {}, "body": body})
 
+    def test_redirect_to_surfaced(self):
+        import urllib.error
+        # unit: 301 with Location must surface redirect_to (no network)
+        self.assertIn("redirect_to", str(S.http_request.__code__.co_consts))
+
+    def test_tls_untrusted_flagged(self):
+        import inspect
+        src = inspect.getsource(S.http_request)
+        self.assertIn("tls_untrusted", src)
+        src2 = inspect.getsource(S.decide)
+        self.assertIn("TLS_UNTRUSTED", src2)
+
     def test_x_powered_by_full(self):
         ver, src, _, bo = self.fp({"X-Powered-By": "PHP/8.5.11"})
         self.assertEqual((ver, src, bo), ("8.5.11", "header:x-powered-by", False))
@@ -265,7 +277,8 @@ class TestLiveLab(unittest.TestCase):
     def _scan(self, port):
         res = S.scan_endpoint("127.0.0.1", port, 10, False, True, False, False, self.opener)
         self.assertTrue(res, f"no findings for port {port}")
-        return res[0]
+        # both schemes probed: prefer reachable (http first), fall back to [0]
+        return next((f for f in res if f.reachable), res[0])
 
     def test_all_scenarios(self):
         for name, (port, want) in LAB.items():
@@ -378,6 +391,31 @@ class TestLiveLab(unittest.TestCase):
         self.assertEqual(ff.verdict, "PHP_NO_VERSION", ff.detail)
         self.assertIn("18.0.81", ff.detail)
 
+    def test_tls_appliance_both_schemes(self):
+        # TLS on non-standard port: strict sees TLS_UNTRUSTED on https
+        # (self-signed) and scans behind it with insecure opener.
+        op = self.opener
+        strict = S.scan_endpoint("127.0.0.1", 19098, 10, False, True, False, False, op)
+        by_scheme = {f.scheme: f for f in strict}
+        self.assertIn("https", by_scheme)
+        self.assertEqual(by_scheme["https"].verdict, "TLS_UNTRUSTED", by_scheme["https"].detail)
+        self.assertIn("--insecure", by_scheme["https"].detail)
+        op2 = S.make_opener(10, True)
+        vuln = S.scan_endpoint("127.0.0.1", 19098, 10, True, True, False, False, op2)
+        best = [f for f in vuln if f.verdict == "VULNERABLE"]
+        self.assertTrue(best, [(f.scheme, f.verdict) for f in vuln])
+        self.assertTrue(best[0].oracle_positive)
+        self.assertIn("8.5.11", best[0].php_version or "")
+
+    def test_downgrade_stub_scanned_behind(self):
+        # :19099 http 301 -> https://:19098: with insecure opener the scanner
+        # follows the upgrade and reports the PHP behind the stub.
+        op2 = S.make_opener(10, True)
+        res = S.scan_endpoint("127.0.0.1", 19099, 10, True, True, False, False, op2)
+        self.assertTrue(res)
+        joined = " ".join(f.verdict + (f.php_version or "") for f in res)
+        self.assertIn("8.5.11", joined, [(f.scheme, f.verdict) for f in res])
+
     def test_panel_fingerprints_unit(self):
         # unit-level: panel bodies attribute without network
         ver, _, sigs, _ = S.fingerprint_response(
@@ -413,7 +451,14 @@ class TestLiveLab(unittest.TestCase):
                 cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             self.assertEqual(r.returncode, 2, r.stdout[:500])  # vuln found -> rc 2
             data = json.loads(r.stdout)
-            by_port = {d["port"]: d["verdict"] for d in data}
+            by_port: dict = {}
+            for d in data:
+                # both schemes probed: keep the most severe verdict per port
+                sev = {"VULNERABLE": 0, "LIKELY_VULNERABLE": 1, "PHP_NO_VERSION": 2,
+                       "PHP_CANNOT_RULE_OUT": 2, "PHP_UNKNOWN": 3, "PATCHED": 4,
+                       "TLS_UNTRUSTED": 5, "NO_PHP_SIGNAL": 6, "UNREACHABLE": 7}
+                if d["port"] not in by_port or sev.get(d["verdict"], 9) < sev.get(by_port[d["port"]], 9):
+                    by_port[d["port"]] = d["verdict"]
             self.assertEqual(by_port[19081], "VULNERABLE")
             self.assertEqual(by_port[19083], "PATCHED")
         finally:
@@ -438,7 +483,7 @@ class TestAffectedFleet(unittest.TestCase):
     def _scan(self, port):
         res = S.scan_endpoint("127.0.0.1", port, 12, False, True, False, False, self.opener)
         self.assertTrue(res, f"no findings for port {port}")
-        return res[0]
+        return next((f for f in res if f.reachable), res[0])
 
     def test_vuln_apps_fire_oracle(self):
         for name, port in VULN_FLEET.items():

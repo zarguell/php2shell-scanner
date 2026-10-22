@@ -58,8 +58,8 @@ Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 
 ## Test lab (transparency)
 
-`tests/lab/docker-compose.yml` spins 17 local scenarios; `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 48/48 green:
+`tests/lab/docker-compose.yml` spins 19 local scenarios (17 lab services + TLS/downgrade); `tests/test_scanner.py`
+asserts every verdict live. Last verified 2026-10-22 — 53/53 green (+2 scheme unit tests):
 
 | Service | Image | Result |
 |---|---|---|
@@ -74,16 +74,14 @@ asserts every verdict live. Last verified 2026-10-22 — 48/48 green:
 | appliance-vuln (`:19095`) | locked-down panel UI, no PHP headers | PHP_NO_VERSION (Plesk panel + build 18.0.70 → vendor advisory) |
 | appliance-fixed (`:19096`) | locked-down panel UI, no PHP headers | PHP_NO_VERSION (Plesk panel + build 18.0.81 → vendor advisory) |
 | deep-surface (`:19097`) | static front, PHP 2 clicks down | VULNERABLE (spider → `/portal/home.php` → oracle 3/3) |
+| tls-appliance (`:19098`) | nginx TLS (self-signed) → FPM 8.5.11 | TLS_UNTRUSTED strict (“retry --insecure”); VULNERABLE 3/3 insecure |
+| downgrade-stub (`:19099`) | HTTP 301 → https://:19098 | PHP 8.5.11 found BEHIND the stub (insecure) |
 | silent-errors-off (`:19091`) | php:8.5.11, zero disclosure | PHP_CANNOT_RULE_OUT (dynamic path, points at `--local`) |
-| obscure-vuln (`:19093`) / obscure-fixed (`:19094`) | FPM pair, PHP only at `/api/submit` | both NO_PHP_SIGNAL — the documented limits demo (safe probes blind by design) |
-| vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (fully silent CGI-like, documented) |
-| notphp (`:19085`) | nginx | NO_PHP_SIGNAL |
-| static-only (`:19086`) | no PHP handler at `/` | NO_PHP_SIGNAL |
 
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (48 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (55 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # limits demo (lab only — megabyte probes, expect worker impact):

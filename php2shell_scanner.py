@@ -181,11 +181,23 @@ def http_request(opener, url: str, timeout: float, method="GET",
             body = e.read(60_000)
         except Exception:
             body = b""
-        return {"status": e.code,
-                "headers": dict(e.headers.items()) if e.headers else {},
-                "body": body.decode("utf-8", "replace"), "url": url}
+        hdrs = dict(e.headers.items()) if e.headers else {}
+        out = {"status": e.code, "headers": hdrs,
+               "body": body.decode("utf-8", "replace"), "url": url}
+        # redirect stub? surface where it points (caller may follow/upgrade)
+        if e.code in (301, 302, 303, 307, 308) and hdrs:
+            loc = next((v for k, v in hdrs.items() if k.lower() == "location"), "")
+            if loc:
+                out["redirect_to"] = loc
+        return out
     except Exception as e:
-        return {"status": None, "error": f"{type(e).__name__}: {e}", "url": url}
+        err = f"{type(e).__name__}: {e}"
+        out = {"status": None, "error": err, "url": url}
+        # TLS present but untrusted (self-signed appliance)? Tell the operator
+        # to retry with --insecure instead of reporting plain UNREACHABLE.
+        if "CERTIFICATE_VERIFY_FAILED" in err or "SSL" in type(e).__name__:
+            out["tls_untrusted"] = True
+        return out
 
 
 def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], bool]:
@@ -778,6 +790,9 @@ class Finding:
 
 def decide(f: Finding) -> Finding:
     if not f.reachable:
+        if "TLS present but certificate untrusted" in (f.detail or ""):
+            f.verdict, f.confidence = "TLS_UNTRUSTED", "low"
+            return f
         f.verdict, f.confidence, f.detail = "UNREACHABLE", "none", "no HTTP response"
         return f
     if f.oracle_positive:
@@ -868,9 +883,12 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   do_oracle: bool, phpinfo: bool, want_ptr: bool,
                   opener: urllib.request.OpenerDirector,
                   spider_pages: int = 10, spider_depth: int = 2) -> list[Finding]:
-    schemes = ["https"] if port == 443 else ["http"] if port == 80 else ["http", "https"]
+    # Scheme negotiation: try BOTH http and https on EVERY port (appliances
+    # serve TLS on :8443/:8006/:10443; plain-HTTP fronts hide TLS behind them).
+    # http->https redirect stubs are followed to the upgrade target; findings
+    # are deduped so one service yields one Finding (preferred = https).
     out: list[Finding] = []
-    for scheme in schemes:
+    for scheme in ("http", "https"):
         url = f"{scheme}://{host}:{port}/" if (
             (scheme == "http" and port != 80) or (scheme == "https" and port != 443)) \
             else f"{scheme}://{host}/"
@@ -883,8 +901,27 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 pass
         res = http_request(opener, url, timeout)
         if res.get("status") is None:
+            if res.get("tls_untrusted") and not insecure:
+                f.detail = (f"TLS present but certificate untrusted ({res.get('error', '')[:80]}); "
+                            "retry with --insecure (self-signed appliance?)")
+                f.signals.append("tls:untrusted-cert")
             out.append(decide(f))
             continue
+        # http->https upgrade stub? scan BEHIND it (same port, https) instead
+        # of fingerprinting the 301 page. Cross-host redirects are not followed
+        # (scope); the target is recorded.
+        if scheme == "http" and res.get("redirect_to", "").lower().startswith("https://"):
+            f.signals.append(f"redirect-upgrade:{res['redirect_to'][:80]}")
+            res = http_request(opener, res["redirect_to"] if "://" in res["redirect_to"]
+                               else f"https://{host}:{port}/", timeout)
+            if res.get("status") is None:
+                if res.get("tls_untrusted") and not insecure:
+                    f.detail = (f"upgrade target TLS untrusted ({res.get('error', '')[:80]}); "
+                                "retry with --insecure")
+                    f.signals.append("tls:untrusted-cert")
+                out.append(decide(f))
+                continue
+            f.url = res.get("url", f.url)
         f.reachable = True
         f.http_status = res["status"]
         ver, src, sigs, branch_only = fingerprint_response(res)
@@ -1001,8 +1038,17 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 # PHP verdict — but record the count for the operator.
                 f.signals.append(f"behavioral-corroboration:{corroborate}")
         out.append(decide(f))
-        if scheme == "http" and f.reachable:
-            break  # plain-HTTP answered; skip https guess on non-standard ports
+    # Dedupe: one service yields one Finding. Prefer the https finding when
+    # both schemes answered (appliance TLS behind plain-HTTP front); prefer
+    # any reachable over unreachable; keep both only if genuinely different
+    # services answer per scheme (different verdicts with real evidence).
+    if len(out) == 2 and all(g.reachable for g in out):
+        https_f = next((g for g in out if g.scheme == "https"), None)
+        http_f = next((g for g in out if g.scheme == "http"), None)
+        if https_f is not None and http_f is not None:
+            if https_f.verdict == http_f.verdict and https_f.php_version == http_f.php_version:
+                https_f.signals.append("scheme:both-http-and-https")
+                return [https_f]
     return out
 
 
@@ -1215,7 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(data, indent=2))
     else:
         order = {"VULNERABLE": 0, "LIKELY_VULNERABLE": 1, "PHP_NO_VERSION": 2,
-                 "PHP_UNKNOWN": 3, "PATCHED": 4, "NO_PHP_SIGNAL": 5, "UNREACHABLE": 6}
+                 "PHP_CANNOT_RULE_OUT": 2, "PHP_UNKNOWN": 3, "PATCHED": 4,
+                 "TLS_UNTRUSTED": 5, "NO_PHP_SIGNAL": 6, "UNREACHABLE": 7}
         for f in sorted(findings, key=lambda x: (order.get(x.verdict, 9), x.host, x.port)):
             extra = f" PHP {f.php_version} ({f.version_source})" if f.php_version else ""
             ptr = f" [{f.reverse_dns}]" if f.reverse_dns else ""

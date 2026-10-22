@@ -1,0 +1,3 @@
+# Throwaway self-signed lab cert (CN=php2shell-lab, 7 days). Regenerate with
+# ./gen-tls-cert.sh. Never use outside the local lab.
+tls-cert/

@@ -187,3 +187,29 @@ services:
       && printf '<html><head><title>Portal</title></head><body><h1>Portal</h1><a href=\"/portal/home.php\">Enter</a></body></html>' > /var/www/html/portal/index.html
       && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"portal-home:\" . htmlspecialchars($$q);' > /var/www/html/portal/home.php
       && docker-php-entrypoint apache2-foreground"
+  # TLS-APPLIANCE: vuln 8.5.11 behind nginx TLS on non-standard port (like a
+  # :8443 management UI), self-signed cert, errors ON. Proves both-scheme
+  # probing + --insecure path: strict verification sees TLS but untrusted.
+  tls-backend:
+    image: php:8.5.11-fpm
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"tls-ok \"; echo phpversion();' > /var/www/html/index.php
+      && php-fpm"
+  tls-front:
+    image: nginx:alpine
+    ports: ["19098:443"]
+    volumes:
+      - ./tls-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./tls-cert:/etc/nginx/tls:ro
+    depends_on:
+      - tls-backend
+  # DOWNGRADE stub: plain HTTP on :19099 redirects to the TLS appliance
+  # (:19098) — proves the scanner follows the upgrade and scans BEHIND the
+  # stub instead of fingerprinting the 301 page. No local service needed;
+  # covered by the redirect_to unit test + live 19098 TLS tests.
+  downgrade-stub:
+    image: nginx:alpine
+    ports: ["19099:80"]
+    volumes:
+      - ./downgrade-nginx.conf:/etc/nginx/conf.d/default.conf:ro

@@ -222,16 +222,29 @@ regardless of vendor — plus a harvester that learns the site's own surface:
   2+ on an otherwise silent box is recorded for the operator. Deliberately
   NOT a verdict escalator: generic dynamic-handler evidence is not PHP
   evidence, and the obscure-pair test pins that NO_PHP_SIGNAL stands.
+
+### Layer G — scheme negotiation: both protocols, upgrades, TLS honesty
+
+The old logic (HTTP-only on :80, HTTPS-only on :443, stop after HTTP answers)
+missed appliance TLS on :8443-style ports and fingerprinted redirect stubs
+instead of the app behind them. Now: every port is probed with BOTH schemes;
+`http→https` same-port upgrade stubs are followed and scanned behind (the
+finding records `redirect-upgrade:`); findings dedupe to one per service
+(https preferred on identical verdicts). TLS with an untrusted cert
+(self-signed appliance) is its own verdict — `TLS_UNTRUSTED`, "retry with
+`--insecure`" — instead of silent `UNREACHABLE`. Lab proof: vuln 8.5.11
+FPM behind nginx TLS on :19098 → `TLS_UNTRUSTED` strict, `VULNERABLE` 3/3
+with `--insecure`; `:19099` 301-stub → PHP 8.5.11 found behind it.
+
 ### Layer D, worked example — the silent-obscure limits demo
 
 The repo ships a deployment where safe probes genuinely go blind, so the
 limitation is demonstrated, not asserted (`tests/lab/docker-compose.yml`:
-
+`obscure-*`; nginx config `tests/lab/obscure-nginx*.conf`):
 - **Shape.** PHP-FPM behind nginx, `display_errors=Off`, `expose_php=Off`,
   no `Server` header, static `/`, PHP reachable ONLY at `/api/submit` (no
   `.php` location block — every candidate/app/deploy guess 404s at nginx;
   404-differential negative). Twin builds: **8.5.11 vuln** (`:19093`) and
-  **8.5.12 patched** (`:19094`), byte-identical routing.
 - **Safe-probe result (pinned in tests).** Both return `NO_PHP_SIGNAL`,
   oracle negative on both. Indistinguishable — honestly reported.
 - **Unsafe demos (lab only, never shipped).**
