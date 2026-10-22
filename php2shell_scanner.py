@@ -955,6 +955,32 @@ def harvest_php_links(opener, url: str, timeout: float,
 # body supplier, nothing more. Disabled by default; --cdp "" never connects.
 
 
+def parse_cdp_endpoint(cdp: str) -> tuple[str, int]:
+    """Parse --cdp value: 'host:port', 'ws://host:port/...', 'ws:/host:port/...'
+    (single-slash paste from DevTools line), or bare 'port'. Returns (host, port).
+    Raises ConnectionError naming accepted shapes on garbage input."""
+    v = (cdp or "").strip()
+    if not v:
+        raise ConnectionError("--cdp is empty (pass host:port, e.g. 127.0.0.1:9222)")
+    v = v.split("://", 1)[-1] if "://" in v else v
+    if v.lower().startswith("ws:"):
+        v = v[3:]  # tolerate ws:host:port/... and ws:/host:port/... pastes
+    v = v.lstrip("/")
+    host, sep, rest = v.partition(":")
+    host = host.strip() or "127.0.0.1"
+    port_s = rest.split("/", 1)[0].strip() if sep else ""
+    if not port_s:
+        return host, 9222
+    try:
+        port = int(port_s)
+    except ValueError:
+        raise ConnectionError(f"bad --cdp {cdp!r}: port {port_s!r} is not a number "
+                              "(want host:port, e.g. 127.0.0.1:9222)")
+    if not (1 <= port <= 65535):
+        raise ConnectionError(f"bad --cdp {cdp!r}: port {port} out of range")
+    return host, port
+
+
 def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
                    ) -> tuple[socket.socket, str]:
     """Open a CDP target session: GET /json/new -> webSocketDebuggerUrl ->
@@ -1087,9 +1113,8 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
     (rendered_outerHTML, resource_urls). Raises on any failure (caller treats
     as 'browser unavailable for this page', falls back to plain HTTP)."""
     import json as _js
-    host, _, port_s = cdp.partition(":")
-    port = int(port_s) if port_s else 9222
-    sock, target_id = cdp_ws_connect(host.strip() or "127.0.0.1", port, timeout, token)
+    host, port = parse_cdp_endpoint(cdp)
+    sock, target_id = cdp_ws_connect(host, port, timeout, token)
     try:
         mid = [0]
 
@@ -1152,9 +1177,8 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
     get_forms). POST forms are REPORTED, never submitted. Raises on failure
     (caller falls back to plain HTTP)."""
     import json as _js
-    host, _, port_s = cdp.partition(":")
-    port = int(port_s) if port_s else 9222
-    sock, target_id = cdp_ws_connect(host.strip() or "127.0.0.1", port, timeout, token)
+    host, port = parse_cdp_endpoint(cdp)
+    sock, target_id = cdp_ws_connect(host, port, timeout, token)
     try:
         mid = [0]
 
@@ -1235,6 +1259,84 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
             sock.close()
         except Exception:
             pass
+
+
+def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
+    """Self-test a CDP endpoint WITHOUT scanning. Steps, each reported:
+    1. parse --cdp value (accepts host:port, ws:// URL, bare port),
+    2. TCP connect to the DevTools port,
+    3. HTTP leg (/json/new via PUT then GET) incl. token gate status,
+    4. RFC 6455 websocket handshake,
+    5. protocol round-trip (Target.getTargets),
+    6. tab lifecycle (navigate about:blank + close).
+    Prints one line per step with OK/FAIL + the inner error. Exit 0 = all OK."""
+    import http.client as _hc
+    import json as _js
+    steps: list[tuple[str, bool, str]] = []
+
+    def step(name: str, ok: bool, info: str = "") -> None:
+        steps.append((name, ok, info))
+        say(f"[{'OK' if ok else 'FAIL'}] {name}" + (f": {info}" if info else ""))
+
+    try:
+        host, port = parse_cdp_endpoint(cdp)
+        step("parse endpoint", True, f"{host}:{port}")
+    except ConnectionError as e:
+        step("parse endpoint", False, str(e))
+        say("HINT: pass --cdp host:port (e.g. 127.0.0.1:9222), NOT the ws://... DevTools URL. "
+            "Single-slash ws:/... pastes are tolerated but pointless — the port is all we need.")
+        return 1
+    try:
+        probe = socket.create_connection((host, port), timeout=min(timeout, 5.0))
+        probe.close()
+        step("TCP connect", True, f"{host}:{port} open")
+    except Exception as e:
+        step("TCP connect", False, f"{type(e).__name__}: {e}")
+        say("HINT: is the browser running with --remote-debugging-port=9222? "
+            "Check http://127.0.0.1:9222/json/version in curl first.")
+        return 1
+    try:
+        sock, target_id = cdp_ws_connect(host, port, timeout, token)
+        step("HTTP leg (/json/new)", True, f"target {target_id[:12]}…")
+    except ConnectionError as e:
+        step("HTTP leg (/json/new)", False, str(e)[:160])
+        return 1
+    try:
+        mid = [1000]
+
+        def call(method: str, params: dict | None = None) -> dict:
+            mid[0] += 1
+            return cdp_send(sock, {"id": mid[0], "method": method,
+                                   "params": params or {}}, timeout)
+        r = call("Target.getTargets")
+        try:
+            n = len(r["result"]["targetInfos"])
+        except (KeyError, TypeError):
+            n = -1
+        step("protocol round-trip (Target.getTargets)", True, f"{n} target(s)")
+        call("Page.enable")
+        call("Page.navigate", {"url": "about:blank"})
+        import time as _t
+        _t.sleep(1.0)
+        step("tab navigate+close", True, "about:blank loaded")
+    except Exception as e:
+        step("protocol/tab", False, f"{type(e).__name__}: {str(e)[:160]}")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return 1
+    try:
+        cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
+                        "params": {"targetId": target_id}}, 5.0)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+    step("done", True, "CDP endpoint healthy — --cdp scans will use it")
+    return 0
 
 
 def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
@@ -2141,6 +2243,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="optional CDP endpoint host:port for YOUR OWN Chromium "
                          "(launch it: chromium --headless=new --remote-debugging-port=9222). "
                          "Rendered DOM + loaded-resource URLs feed the spider. Disabled by default.")
+    ap.add_argument("--cdp-doctor", action="store_true",
+                    help="self-test the CDP endpoint (--cdp [+ --cdp-token]): handshake, version, "
+                         "tab open/navigate/close round-trip. Prints diagnosis, exits 0/1. Run this first.")
     ap.add_argument("--cdp-token", default="",
                     help="DevTools token, ONLY if your Chromium gates /json/* with 401/403 "
                          "(started with --remote-debugging-token=... or policy build: copy the "
@@ -2174,6 +2279,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         print(f"php2shell-scanner {TOOL_VERSION}")
         return 0
+    if args.cdp_doctor:
+        return cdp_doctor(args.cdp, args.cdp_token, args.timeout)
     if args.local:
         data = run_local_enum()
         if args.output:

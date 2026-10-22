@@ -780,6 +780,18 @@ class TestCdpBridge(unittest.TestCase):
         self.assertIn("<html", html.lower())
         self.assertTrue(any("loader.js" in u for u in urls), urls)
 
+    def test_cdp_endpoint_parsing(self):
+        self.assertEqual(S.parse_cdp_endpoint("127.0.0.1:9222"), ("127.0.0.1", 9222))
+        self.assertEqual(S.parse_cdp_endpoint("ws://127.0.0.1:9222/devtools/browser/x"),
+                         ("127.0.0.1", 9222))
+        self.assertEqual(S.parse_cdp_endpoint("ws:/127.0.0.1:9222/devtools/browser/x"),
+                         ("127.0.0.1", 9222))
+        self.assertEqual(S.parse_cdp_endpoint("9222"), ("127.0.0.1", 9222))
+        with self.assertRaises(ConnectionError):
+            S.parse_cdp_endpoint("")
+        with self.assertRaises(ConnectionError):
+            S.parse_cdp_endpoint("host:notaport")
+
     def test_token_gate_refused_without_token(self):
         # fake token-gated CDP HTTP leg: no/wrong token -> 401 with hint;
         # right token -> HTTP leg passes (Bearer forwarded).
