@@ -156,6 +156,31 @@ class TestBehavioral(unittest.TestCase):
         self.assertIn("make_bare_opener", src)
 
 
+class TestTimeouts(unittest.TestCase):
+    """Timeout rules: pre-check, budgets, progress routing."""
+    def test_precheck_closed_port_fast(self):
+        import time
+        t0 = time.monotonic()
+        self.assertFalse(S.tcp_open("127.0.0.1", 19991, 1.0))
+        self.assertLess(time.monotonic() - t0, 5.0)
+
+    def test_host_budget_param(self):
+        import inspect
+        sig = inspect.signature(S.scan_endpoint)
+        self.assertIn("host_budget", sig.parameters)
+
+    def test_progress_goes_to_stderr(self):
+        import inspect
+        src = inspect.getsource(S.main)
+        self.assertNotIn('say(f"[*]', src)
+
+    def test_closed_findings_shape(self):
+        f = S.Finding(target="h:1", host="h", port=1, scheme="?", url="")
+        f.detail = "TCP pre-check: port 1 closed/filtered (connect-timeout=1s)"
+        out = S.decide(f)
+        self.assertEqual(out.verdict, "UNREACHABLE")
+
+
 class TestVerbose(unittest.TestCase):
     """Verbose tracing: exact line shapes, stderr routing, level gating."""
     def test_level_gating_off_by_default(self):

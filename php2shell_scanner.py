@@ -1083,13 +1083,25 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   do_oracle: bool, phpinfo: bool, want_ptr: bool,
                   opener: urllib.request.OpenerDirector,
                   spider_pages: int = 10, spider_depth: int = 2,
-                  prove_rce: bool = False) -> list[Finding]:
+                  prove_rce: bool = False, host_budget: float = 120.0) -> list[Finding]:
     # Scheme negotiation: try BOTH http and https on EVERY port (appliances
     # serve TLS on :8443/:8006/:10443; plain-HTTP fronts hide TLS behind them).
     # http->https redirect stubs are followed to the upgrade target; findings
     # are deduped so one service yields one Finding (preferred = https).
+    import time as _t
+    deadline = _t.monotonic() + max(5.0, host_budget)
+    def over() -> bool:
+        return _t.monotonic() >= deadline
     out: list[Finding] = []
     for scheme in ("http", "https"):
+        if over():
+            f = Finding(target=f"{host}:{port}", host=host, port=port, scheme=scheme,
+                        url=f"{scheme}://{host}:{port}/")
+            f.detail = (f"host budget exhausted ({host_budget:.0f}s); "
+                        "partial phases skipped — rerun with --host-budget N")
+            f.signals.append("budget:exhausted")
+            out.append(decide(f))
+            continue
         url = f"{scheme}://{host}:{port}/" if (
             (scheme == "http" and port != 80) or (scheme == "https" and port != 443)) \
             else f"{scheme}://{host}/"
@@ -1164,7 +1176,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                             parse_strict_version(f.php_version))
                         f.signals.append(f"phpinfo:{p}")
                         break
-        if do_oracle:
+        if do_oracle and not over():
             try:
                 pos, ev = run_oracle(opener, url, timeout, spider_pages, spider_depth)
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
@@ -1180,7 +1192,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         # --prove-rce runs the marker-write ONLY through a validated sink and
         # ONLY with double confirmation enforced in main(); scan_endpoint never
         # confirms by itself (prove_rce=True arrives pre-authorized).
-        if f.reachable and do_oracle:
+        if f.reachable and do_oracle and not over():
             try:
                 sinks = discover_lfi_sinks(opener, url, timeout,
                                            f.discovered_paths or None,
@@ -1198,7 +1210,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         # BEHAVIORAL proofs first (generic, no per-app knowledge — these fan
         # out to unseen panels/appliances), hardcoded app tables second
         # (legacy corroboration). All safe requests, no POST/uploads/state.
-        if f.reachable and (not ver or sigs):
+        if f.reachable and (not ver or sigs) and not over():
             # Behavioral corroboration count: generic signals (no per-app
             # knowledge) that each separate dynamic handlers from static
             # servers. 2+ independent corroborations escalate an otherwise
@@ -1467,8 +1479,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reverse-dns", action="store_true", help="PTR lookup for each target IP")
     ap.add_argument("--local", action="store_true",
                     help="on-box enumeration: list local php binaries/versions/SAPIs/processes (run ON the host)")
-    ap.add_argument("--timeout", type=float, default=8.0)
-    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--timeout", type=float, default=8.0, help="per-request ceiling in seconds (default 8)")
+    ap.add_argument("--threads", type=int, default=16, help="scan concurrency (default 16)")
+    ap.add_argument("--connect-timeout", type=float, default=3.0,
+                    help="TCP pre-check ceiling in seconds (default 3; dead hosts fail here fast)")
+    ap.add_argument("--host-budget", type=float, default=120.0,
+                    help="wall-clock cap per host:port in seconds (default 120; slow hosts are cut off with partial findings)")
+    ap.add_argument("--progress", action="store_true", help="per-completion progress lines to stderr (useful for subnets)")
     ap.add_argument("--spider-pages", type=int, default=10,
                     help="max pages the site spider fetches per endpoint (default 10; 0 disables crawl, single-page harvest only)")
     ap.add_argument("--spider-depth", type=int, default=2,
@@ -1540,27 +1557,60 @@ def main(argv: list[str] | None = None) -> int:
     do_oracle = not args.no_oracle
     opener = make_opener(args.timeout, args.insecure)
 
+    # Timeout rules (documented in README "Timeout rules"):
+    #  - `--timeout S` (default 8): per-REQUEST ceiling (connect+read).
+    #  - `--connect-timeout S` (default 3): TCP pre-check ceiling. Dead hosts
+    #    fail here in ~3s instead of eating full HTTP+TLS timeouts per scheme.
+    #  - `--host-budget S` (default 120): wall-clock cap per host:port. A
+    #    slow-but-alive host can never hold a thread past this; remaining
+    #    phases are skipped and the finding records what completed.
+    #  - Pre-check ALWAYS runs (fast TCP open, both default and subnet paths):
+    #    closed/filtered ports become instant UNREACHABLE without HTTP.
+    #  - `--progress` prints per-completion lines to stderr (useful for /24s).
     jobs: list[tuple[str, int]] = []
-    if args.discover_ports:
-        def probe(hp):
-            h, pt = hp
-            return (h, pt) if tcp_open(h, pt, min(args.timeout, 3.0)) else None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
-            for r in ex.map(probe, [(h, p) for h in hosts for p in ports]):
-                if r:
-                    jobs.append(r)
-        if not jobs:
-            say("port discovery: no open web ports found")
+    connect_timeout = max(0.5, min(args.connect_timeout, args.timeout))
+    trace(1, f"pre-check: TCP open on {len(hosts)} host(s) x {len(ports)} port(s) "
+              f"(connect-timeout={connect_timeout}s, threads={args.threads})")
+    def probe(hp):
+        h, pt = hp
+        return (h, pt) if tcp_open(h, pt, connect_timeout) else None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+        cands = [(h, p) for h in hosts for p in ports]
+        if args.progress:
+            trace(0, f"[*] pre-checking {len(cands)} endpoint(s) (TCP)...")
+        for r in ex.map(probe, cands):
+            if r:
+                jobs.append(r)
+    skipped = len(hosts) * len(ports) - len(jobs)
+    if skipped:
+        trace(1, f"pre-check: {skipped} closed/filtered endpoint(s) skipped, "
+                  f"{len(jobs)} open")
+        if args.progress:
+            trace(0, f"[*] {skipped} closed/filtered, {len(jobs)} open — scanning...")
+    if args.discover_ports and not jobs:
+        say("port discovery: no open web ports found")
+    if not jobs:
+        # every endpoint closed: still emit UNREACHABLE findings so output
+        # shape is stable (one row per host:port), then fall through.
+        findings_pre: list[Finding] = []
+        for h, p in [(h, p) for h in hosts for p in ports]:
+            f = Finding(target=f"{h}:{p}", host=h, port=p, scheme="?", url="")
+            f.detail = (f"TCP pre-check: port {p} closed/filtered "
+                        f"(connect-timeout={connect_timeout}s)")
+            findings_pre.append(decide(f))
     else:
-        jobs = [(h, p) for h in hosts for p in ports]
+        findings_pre = []
 
-    findings: list[Finding] = []
+    findings: list[Finding] = list(findings_pre)
     spider_pages = max(0, args.spider_pages)
     spider_depth = max(0, args.spider_depth)
+    host_budget = max(5.0, args.host_budget)
+    t_start = __import__("time").monotonic()
+    done_n = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {ex.submit(scan_endpoint, h, p, args.timeout, args.insecure,
                           do_oracle, args.phpinfo, args.reverse_dns, opener,
-                          spider_pages, spider_depth, prove_rce): (h, p)
+                          spider_pages, spider_depth, prove_rce, host_budget): (h, p)
                 for h, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             try:
@@ -1570,6 +1620,10 @@ def main(argv: list[str] | None = None) -> int:
                 f = Finding(target=f"{h}:{p}", host=h, port=p, scheme="?", url="")
                 f.detail = f"scan error: {e}"
                 findings.append(f)
+            done_n += 1
+            if args.progress:
+                el = __import__("time").monotonic() - t_start
+                trace(0, f"[*] {done_n}/{len(jobs)} endpoints ({el:.0f}s elapsed)...")
 
     data = [asdict(f) for f in findings]
     if args.output:

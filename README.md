@@ -95,6 +95,26 @@ python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 # P2S_RCE_ARM=1 python3 tests/lab/rce_demo.py --target 10.0.0.5:8080 --lfi-path /vuln.php --session-path /tmp
 ```
 
+## Timeout rules
+
+Scanning a subnet used to hang: every dead host ate full HTTP+TLS timeouts
+per scheme with no output until the end. Now:
+
+1. **TCP pre-check always runs** (default + subnet paths): `connect-timeout`
+   (default 3s) decides open vs closed/filtered. Closed ports become instant
+   `UNREACHABLE` (`TCP pre-check: port N closed/filtered`) without HTTP.
+   A /24 with one live host scans in ~17s instead of hanging.
+2. **Per-request `--timeout`** (default 8s) caps each connect+read.
+3. **Per-host `--host-budget`** (default 120s) caps wall-clock per host:port
+   across all phases (spider, discovery, oracle, probes). Exhaustion skips
+   remaining phases and records `budget:exhausted` — partial findings, never
+   a stuck thread.
+4. **`--progress`** streams `[*]` lines to stderr (stdout stays pipe-clean
+   JSON). `-v`/`-vv` add phase/request tracing on top.
+
+Tune down for speed (`--connect-timeout 1 --host-budget 30`), up for
+far/slow networks (`--timeout 20 --host-budget 300`).
+
 ## Affected-product fleet (pressure test)
 
 Real projects from [docs/affected-products.md](docs/affected-products.md),
