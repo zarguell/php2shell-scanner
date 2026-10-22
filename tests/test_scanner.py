@@ -35,6 +35,7 @@ LAB = {  # service -> (port, expected_verdict)
     "deep-surface": (19097, "VULNERABLE"),  # spider-only find: PHP 2 clicks down, oracle via /portal/home.php
     "js-dyn": (19101, "PHP_NO_VERSION"),  # StringTable via runtime JOIN: PHP artifacts proven, no .php surface
     "js-spa": (19100, "VULNERABLE"),  # JS-bundle-only endpoints (?action handler), oracle via /api/v2/endpoint.php
+    "form-crawl": (19102, "VULNERABLE"),  # default crawl: extensionless form action via static guesses
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -532,6 +533,24 @@ class TestLiveLab(unittest.TestCase):
         f = self._scan(19101)
         self.assertEqual(f.verdict, "PHP_NO_VERSION", f.detail)
         self.assertTrue(any("dynjs-artifact" in e for e in f.evidence), f.evidence)
+
+    def test_form_crawl_extensionless_route(self):
+        # extensionless GET-form action (/query -> 301 /query/): the full crawl
+        # must follow the same-resource redirect, dynamic-test, and fire.
+        # Requires CDP + crawl-full; skipped without a browser.
+        import os as _os
+        if not (_os.environ.get("P2S_CDP") or "--cdp-test" in sys.argv):
+            self.skipTest("needs CDP browser")
+        op = self.opener
+        paths, _ = S.discover_php_paths(op, "http://127.0.0.1:19102/", 10,
+                                        cdp="127.0.0.1:9222", crawl_full=True)
+        self.assertIn("/query/", paths)
+        f = S.scan_endpoint("127.0.0.1", 19102, 12, False, True, False, False,
+                            op, 10, 2, False, 120.0,
+                            "127.0.0.1:9222", "", True, "")
+        f = next((x for x in f if x.reachable), f[0])
+        self.assertEqual(f.verdict, "VULNERABLE", f.detail)
+        self.assertIn("/query/", f.oracle_evidence)
 
     def test_js_spa_bundle_only_endpoints(self):
         # index.html has ZERO .php refs; endpoints live in /static/app.js.

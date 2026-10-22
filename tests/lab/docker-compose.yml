@@ -246,3 +246,19 @@ services:
       && mkdir -p /var/www/html/api
       && printf '<?php $$a = $$_GET[\"action\"] ?? \"\"; echo \"dynapi:\" . htmlspecialchars($$a);' > /var/www/html/api/dyn.php
       && docker-php-entrypoint apache2-foreground"
+  # FORM-CRAWL (full-crawl demo): vuln 8.5.11, errors ON, headers stripped.
+  # Front page links NOTHING php (only /about); the PHP surface is a GET form
+  # (action /search.php, inputs q+page) plus a POST login form (reported,
+  # never submitted). --crawl-full must submit the GET form benignly,
+  # discover /search.php?q=p2s&page=p2s, and fire the oracle there.
+  form-crawl:
+    image: php:8.5.11-apache
+    ports: ["19102:80"]
+    volumes:
+      - ./form-crawl/index.html:/var/www/html/index.html:ro
+      - ./form-crawl/about.html:/var/www/html/about:ro
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"results:\" . htmlspecialchars($$q);' > /var/www/html/search.php
+      && printf '<?php echo \"login-ok\";' > /var/www/html/login.php
+      && docker-php-entrypoint apache2-foreground"

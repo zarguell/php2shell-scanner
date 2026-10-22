@@ -469,7 +469,8 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
 
 def discover_php_paths(opener, url: str, timeout: float,
                        spider_pages: int = 10, spider_depth: int = 2,
-                       cdp: str = "", cdp_token: str = ""
+                       cdp: str = "", cdp_token: str = "",
+                       crawl_full: bool = False, cookie: str = ""
                        ) -> tuple[list[str], list[str]]:
     """GET each candidate path; return paths proving PHP execution.
     Candidates = bounded spider crawl (site's own links, spider_depth clicks
@@ -482,7 +483,8 @@ def discover_php_paths(opener, url: str, timeout: float,
     try:
         spider_targets, _, _dyn_art = spider_site(opener, url, min(timeout, 6.0),
                                                   max_pages=spider_pages, max_depth=spider_depth,
-                                                  cdp=cdp, cdp_token=cdp_token)
+                                                  cdp=cdp, cdp_token=cdp_token,
+                                                  crawl_full=crawl_full, cookie=cookie)
     except Exception:
         spider_targets, _dyn_art = set(), []
     try:
@@ -490,19 +492,33 @@ def discover_php_paths(opener, url: str, timeout: float,
     except Exception:
         crawled = []
     ordered = list(dict.fromkeys(sorted(spider_targets) + crawled + list(PHP_PATH_CANDIDATES) + list(CONVENTIONAL_PHP)))
+    _ncrawl = len(spider_targets) + len(crawled)
+    _crawled_set = set(ordered[:_ncrawl])  # crawl-discovered: dynamic-test regardless of suffix
     trace(1, f"discover {base}: {len(spider_targets)} spider + {len(crawled)} harvest + "
               f"{len(PHP_PATH_CANDIDATES) + len(CONVENTIONAL_PHP)} static candidates")
     for p in ordered[:40]:  # cap: spider first, static guesses after
         target = base + p if p != "/" else url
         try:
             res = http_request(opener, target, timeout)
+            if res.get("status") in (301, 302, 303, 307, 308) and res.get("redirect_to"):
+                from urllib.parse import urlparse as _up3
+                _u0, _u1 = _up3(target), _up3(res["redirect_to"])
+                if _u0.hostname == _u1.hostname and _u1.path.rstrip("/") == _u0.path.rstrip("/"):
+                    # same-resource slash redirect (/query -> /query/): follow one hop
+                    p = _u1.path
+                    target = base + p
+                    res = http_request(opener, target, timeout)
+                    _crawled_set.add(p)
+                    trace(1, f"discover {base}{p}: followed slash-redirect")
             if res.get("status") == 404:
                 continue  # no such path — never a PHP endpoint here
             if looks_like_php_response(res):
                 found.append(p)
                 trace(1, f"discover {base}{p}: PHP-PROVEN (header/cookie/redirect)")
                 continue
-            if res.get("status") == 200 and p.endswith(".php"):
+            # Dynamic test: .php suffix OR crawl-discovered (extensionless
+            # routes like /query execute PHP too; the query-delta decides).
+            if res.get("status") == 200 and (p.endswith(".php") or p in _crawled_set):
                 body1 = res.get("body") or ""
                 # dynamic probes: bare random param, common consumed names
                 # (?q/?s/?id/?action/?page/?p — endpoints ignore unknown params
@@ -580,7 +596,7 @@ def discover_lfi_sinks(opener, url: str, timeout: float,
     params: set[str] = set(LFI_PARAM_NAMES)
     link_targets: list[str] = []
     try:
-        _, visited = spider_site(opener, url, min(timeout, 6.0),
+        _, visited, _ = spider_site(opener, url, min(timeout, 6.0),
                                  max_pages=spider_pages, max_depth=spider_depth)
         _ = visited
     except Exception:
@@ -644,7 +660,8 @@ def discover_lfi_sinks(opener, url: str, timeout: float,
 
 
 def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
-               spider_depth: int = 2, cdp: str = "", cdp_token: str = "") -> tuple[bool, str]:
+               spider_depth: int = 2, cdp: str = "", cdp_token: str = "",
+               crawl_full: bool = False, cookie: str = "") -> tuple[bool, str]:
     """Return (positive, evidence). Discovers PHP-executing paths via safe
     GETs (site's own harvested .php links first, then static guesses), then
     POSTs the tiny oracle to each. Positive requires ALL THREE markers on any
@@ -653,7 +670,7 @@ def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
     last_ev = "not run"
     try:
         paths, _ = discover_php_paths(opener, url, timeout, spider_pages, spider_depth, cdp,
-                                          cdp_token)
+                                          cdp_token, crawl_full, cookie)
     except Exception:
         paths = list(ORACLE_PATHS)
     for p in paths:
@@ -872,7 +889,8 @@ def run_timing_probe(opener, url: str, timeout: float) -> tuple[bool, str]:
 # literals). Discovered links feed discover_php_paths' dynamic test — so the
 # scanner learns the SITE'S OWN php surface instead of guessing ours. This is
 # what fans out: N unseen apps -> their own links, one and two clicks down.
-LINK_RX = re.compile(r'''(?:href|src|action)\s*=\s*["']([^"'#>]+?\.php)\b''', re.I)
+LINK_RX = re.compile(r'''(?:href|src)\s*=\s*["']([^"'#>]+?\.php)\b''', re.I)
+FORM_ACTION_RX = re.compile(r'''<form[^>]+action\s*=\s*["']([^"'#>]+)["']''', re.I)
 JS_PHP_RX = re.compile(r'''["']((?:/[A-Za-z0-9_.\-/]*)?[A-Za-z0-9_.\-/]+\.php)\b''')
 CONVENTIONAL_PHP = ("/login.php", "/admin.php", "/api.php", "/search.php",
                     "/contact.php", "/index.php")
@@ -882,6 +900,13 @@ def extract_links(body: str | None) -> set[str]:
     found: set[str] = set()
     if not body:
         return found
+    for m in FORM_ACTION_RX.finditer(body):
+        t = m.group(1).split("?")[0].strip()
+        if t and not t.startswith(("http", "javascript:", "data:", "mailto:", "#", "//")):
+            if not t.startswith("/"):
+                t = "/" + t
+            if len(t) < 128:
+                found.add(t)
     for rx in (LINK_RX, JS_PHP_RX):
         for m in rx.finditer(body):
             t = m.group(1).split("?")[0].strip()
@@ -1117,9 +1142,105 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
             pass
 
 
+def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
+                   wait_ms: int = 1500, extra_headers: dict | None = None
+                   ) -> tuple[str, list[str], list[str], list[tuple[str, str]]]:
+    """Burp/ZAP-class discovery for ONE page (safe subset): rendered DOM,
+    network-observed request URLs (XHR/fetch/api — the page's REAL traffic,
+    not just resource timing), same-origin clickable hrefs, and GET-form
+    (action, inputs) targets. Returns (html, resource_urls, click_hrefs,
+    get_forms). POST forms are REPORTED, never submitted. Raises on failure
+    (caller falls back to plain HTTP)."""
+    import json as _js
+    host, _, port_s = cdp.partition(":")
+    port = int(port_s) if port_s else 9222
+    sock, target_id = cdp_ws_connect(host.strip() or "127.0.0.1", port, timeout, token)
+    try:
+        mid = [0]
+
+        def call(method: str, params: dict | None = None) -> dict:
+            mid[0] += 1
+            return cdp_send(sock, {"id": mid[0], "method": method,
+                                   "params": params or {}}, timeout)
+        call("Page.enable")
+        call("Runtime.enable")
+        call("Network.enable")
+        if extra_headers:
+            try:
+                call("Network.setExtraHTTPHeaders", {"headers": extra_headers})
+            except Exception:
+                pass
+        seen_urls: list[str] = []
+        call("Page.navigate", {"url": page_url})
+        import time as _t
+        deadline = _t.monotonic() + min(timeout, 15.0)
+        while _t.monotonic() < deadline:
+            r = call("Runtime.evaluate", {"expression": "document.readyState",
+                                          "returnByValue": True})
+            try:
+                if r["result"]["result"]["value"] in ("complete", "interactive"):
+                    break
+            except (KeyError, TypeError):
+                pass
+            _t.sleep(0.25)
+        _t.sleep(min(wait_ms / 1000.0, 5.0))
+        dom = call("Runtime.evaluate", {
+            "expression": "document.documentElement ? document.documentElement.outerHTML : ''",
+            "returnByValue": True})
+        try:
+            html = dom["result"]["result"]["value"] or ""
+        except (KeyError, TypeError):
+            html = ""
+        net = call("Runtime.evaluate", {
+            "expression": ("(function(){var out={res:[],clicks:[],forms:[]};"
+                           "try{out.res=performance.getEntriesByType('resource')"
+                           ".map(function(e){return e.name}).slice(0,100)}catch(e){}"
+                           "try{out.clicks=Array.prototype.slice.call("
+                           "document.querySelectorAll('a[href],button,[onclick]'))"
+                           ".map(function(el){return el.getAttribute('href')||"
+                           "el.getAttribute('data-href')||''})"
+                           ".filter(function(h){return h && h.charAt(0)!=='#'})"
+                           ".slice(0,100)}catch(e){}"
+                           "try{out.forms=Array.prototype.slice.call("
+                           "document.querySelectorAll('form'))"
+                           ".map(function(f){return (f.getAttribute('action')||'')+'|'+"
+                           "(f.getAttribute('method')||'GET')+'|'+"
+                           "Array.prototype.slice.call(f.querySelectorAll('input[name]'))"
+                           ".map(function(i){return i.getAttribute('name')}).join(',')})"
+                           ".slice(0,50)}catch(e){}"
+                           "return out})()"),
+            "returnByValue": True})
+        try:
+            val = net["result"]["result"]["value"] or {}
+        except (KeyError, TypeError):
+            val = {}
+        res_urls = [u for u in (val.get("res") or []) if isinstance(u, str)][:100]
+        clicks = [u for u in (val.get("clicks") or []) if isinstance(u, str)][:100]
+        forms = []
+        for f in (val.get("forms") or [])[:50]:
+            try:
+                action, method, inputs = (f.split("|") + ["", "", ""])[:3]
+                forms.append((action.strip(), method.strip().upper() or "GET",
+                              inputs.strip()))
+            except Exception:
+                continue
+        return html, res_urls, clicks, forms
+    finally:
+        try:
+            cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
+                            "params": {"targetId": target_id}}, 5.0)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                 max_depth: int = 2, js_bundles: int = 3, cdp: str = "",
-                cdp_token: str = ""
+                cdp_token: str = "", crawl_full: bool = False,
+                cookie: str = ""
                 ) -> tuple[set[str], set[str], list[str]]:
     """Bounded BFS crawl for PHP surface. Returns (php_targets, visited).
     Seeds at `/`; follows same-origin HTML links (any href, not just .php)
@@ -1151,6 +1272,8 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
     js_fetched = 0
     pages = 0
     dyn_artifacts: list[str] = []
+    _seen_hashes: set[str] = set()
+    post_forms: list[str] = []
     def dyn_refs(text: str) -> list[str]:
         # Order = fetch priority under the js_bundles budget: lang-completed
         # JOINs first (resolvable to a real file), then JOIN prefix+suffix
@@ -1182,13 +1305,15 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                 dyn_artifacts.append(f"spider-dynjs-artifact:{ds} matched='{hit}' | '{ctx}'")
                 trace(1, f"spider-dynjs {ds} ARTIFACT {hit}")
                 break
+    _ck = {"Cookie": cookie} if cookie else None
     while queue and pages < max_pages:
         path, depth = queue.pop(0)
         if path in visited:
             continue
         visited.add(path)
         try:
-            res = http_request(opener, base + path if path != "/" else url, timeout)
+            res = http_request(opener, base + path if path != "/" else url, timeout,
+                               headers=_ck)
         except Exception:
             continue
         pages += 1
@@ -1197,7 +1322,79 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                       if k.lower() == "content-type"), "").lower()
         new_targets = extract_links(body) - php_targets
         php_targets |= new_targets
-        if cdp:
+        import hashlib as _hl
+        import re as _re2
+        _norm = _re2.sub(r"(csrf|token|sessid|nonce|cb|t)=[^&<> ]+", r"\\1=", body)[:20000]
+        _dh = _hl.sha256(_norm.encode("utf-8", "replace")).hexdigest()[:16]
+        if _dh in _seen_hashes:
+            trace(1, f"spider {base}{path} content-dupe, probes skipped")
+            continue
+        _seen_hashes.add(_dh)
+        if cdp and crawl_full:
+            # FULL crawl (Burp/ZAP-class discovery, safe subset): rendered DOM
+            # + network-observed XHR/API urls + clickable hrefs + GET-form
+            # submissions with benign values. POST forms REPORTED, never sent.
+            try:
+                _xh = {"Cookie": cookie} if cookie else None
+                _html, _res, _clicks, _forms = cdp_full_crawl(
+                    cdp, base + path if path != "/" else url, timeout,
+                    token=cdp_token, extra_headers=_xh)
+                for t in extract_links(_html):
+                    if t not in php_targets:
+                        new_targets.add(t)
+                        php_targets.add(t)
+                for _u in _res:
+                    try:
+                        from urllib.parse import urlparse as _up2
+                        _uu = _up2(_u)
+                        if _uu.hostname != host:
+                            continue
+                        _p = _uu.path or ""
+                        if _p.endswith(".php") and len(_p) < 128:
+                            php_targets.add(_p)
+                            new_targets.add(_p)
+                    except Exception:
+                        continue
+                for _h in _clicks:
+                    _hh = _h.split("?")[0].split("#")[0].strip()
+                    if not _hh or len(_hh) >= 128:
+                        continue
+                    if not _hh.startswith("/"):
+                        _hh = "/" + _hh
+                    if _hh not in visited and depth + 1 <= max_depth + 1:
+                        queue.append((_hh, depth + 1))
+                for _action, _method, _inputs in _forms:
+                    _ap = (_action or path).split("?")[0]
+                    if not _ap.startswith("/"):
+                        _ap = "/" + _ap
+                    if _method == "GET" and len(_ap) < 128 and _ap not in visited:
+                        # benign submission: fixed safe values per input
+                        _q = "&".join(f"{_n}=p2s" for _n in _inputs.split(",") if _n.strip()) or "p2s=1"
+                        try:
+                            _fr = http_request(opener, base + _ap + "?" + _q, timeout,
+                                               headers={"Cookie": cookie} if cookie else None)
+                            visited.add(_ap + "?" + _q)
+                            for t in extract_links(_fr.get("body") or ""):
+                                if t not in php_targets:
+                                    new_targets.add(t)
+                                    php_targets.add(t)
+                            check_artifacts(_fr.get("body") or "", _ap)
+                            if _ap not in php_targets:
+                                php_targets.add(_ap)
+                                new_targets.add(_ap)
+                        except Exception:
+                            continue
+                    elif _method != "GET":
+                        trace(1, f"spider-cdp {base}{path} POST-form reported (never sent): {_ap}")
+                        if _ap not in post_forms:
+                            post_forms.append(_ap)
+                if _html or _res:
+                    trace(1, f"spider-cdp-full {base}{path} rendered={len(_html)}B "
+                              f"net={len(_res)} clicks={len(_clicks)} forms={len(_forms)}")
+            except Exception as e:
+                trace(1, f"spider-cdp {base}{path} unavailable "
+                          f"({type(e).__name__}: {str(e)[:120]})")
+        if cdp and not crawl_full:
             try:
                 rhtml, rurls = cdp_rendered_page(cdp, base + path if path != "/" else url,
                                                  timeout, token=cdp_token)
@@ -1367,6 +1564,8 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
             # keep the trailing slash so the fetch hits the same resource
             if len(href) < 128 and href not in visited:
                 queue.append((href, depth + 1))
+    for _pf in post_forms:
+        dyn_artifacts.append(f"spider-cdp-postform:{_pf} (reported, never submitted)")
     return php_targets, visited, dyn_artifacts
 
 
@@ -1520,7 +1719,8 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   opener: urllib.request.OpenerDirector,
                   spider_pages: int = 10, spider_depth: int = 2,
                   prove_rce: bool = False, host_budget: float = 120.0,
-                  cdp: str = "", cdp_token: str = "") -> list[Finding]:
+                  cdp: str = "", cdp_token: str = "", crawl_full: bool = False,
+                  cookie: str = "") -> list[Finding]:
     # Scheme negotiation: try BOTH http and https on EVERY port (appliances
     # serve TLS on :8443/:8006/:10443; plain-HTTP fronts hide TLS behind them).
     # http->https redirect stubs are followed to the upgrade target; findings
@@ -1617,13 +1817,13 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         if do_oracle and not over():
             try:
                 pos, ev = run_oracle(opener, url, timeout, spider_pages, spider_depth, cdp,
-                                          cdp_token)
+                                          cdp_token, crawl_full, cookie)
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
                 # surface which paths proved PHP execution even when silent
                 try:
                     _paths, _art = discover_php_paths(opener, url, timeout,
                                                       spider_pages, spider_depth, cdp,
-                                                      cdp_token)
+                                                      cdp_token, crawl_full, cookie)
                     f.discovered_paths = _paths[1:]
                     for _sig in _art:
                         mark(f, _sig)
@@ -1946,6 +2146,13 @@ def main(argv: list[str] | None = None) -> int:
                          "(started with --remote-debugging-token=... or policy build: copy the "
                          "token from its stderr 'token=' line). Sent as Bearer on the CDP "
                          "HTTP leg + websocket handshake. Empty (default) = no auth.")
+    ap.add_argument("--crawl-full", action="store_true",
+                    help="Burp/ZAP-class discovery via YOUR Chromium (requires --cdp): rendered DOM, "
+                         "network-observed XHR/API urls, clickable hrefs, benign GET-form submissions. "
+                         "POST forms reported, never sent. Heavier (~2-4x requests); default off.")
+    ap.add_argument("--cookie", default="",
+                    help="session cookie for crawl scope, e.g. --cookie 'PHPSESSID=abc123' "
+                         "(sent on crawl + CDP requests; use YOUR OWN authorized session)")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (labs/self-signed)")
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="trace to stderr: -v per-phase lines (fingerprint/spider/discover/oracle/verdict), "
@@ -2067,7 +2274,8 @@ def main(argv: list[str] | None = None) -> int:
         futs = {ex.submit(scan_endpoint, h, p, args.timeout, args.insecure,
                           do_oracle, args.phpinfo, args.reverse_dns, opener,
                           spider_pages, spider_depth, prove_rce, host_budget,
-                          args.cdp, args.cdp_token): (h, p)
+                          args.cdp, args.cdp_token, args.crawl_full,
+                          args.cookie): (h, p)
                 for h, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             try:

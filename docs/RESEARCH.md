@@ -274,7 +274,16 @@ That catches what static parsing cannot — e.g. the js-dyn StringTable, which
 the browser loads (`StringTable_en.js` in resources) even though no static
 or dynamic ref names the final URL. Resource URLs are now FETCHED through the
 same artifact parser (not just listed): browser-observed bundles join the
-evidence channel like spider-fetched ones. If your Chromium gates `/json/*`
+evidence channel like spider-fetched ones.
+`--crawl-full` (requires `--cdp`) upgrades this to Burp/ZAP-class discovery:
+rendered DOM + network-observed XHR/API urls + clickable hrefs + benign
+GET-form submissions (fixed safe values; POST forms reported, never sent) +
+`--cookie` session passthrough + content-hash dedupe (session-token noise
+normalized away). Extensionless form actions (`/query` → 301 `/query/`) are
+followed as same-resource redirects and admitted to the dynamic test. Live
+proof (`form-crawl` lab): unconventional `/finder.php`, then extensionless
+`/query`, found via submitted GET forms and fired 3/3 — where static guesses
+and single-page harvest are blind. If your Chromium gates `/json/*`
 with 401/403, relaunch with `--remote-debugging-token=...` and pass
 `--cdp-token`. CDP failures log the inner error
 (`unavailable (ConnectionError: …)`), not just the type name.
