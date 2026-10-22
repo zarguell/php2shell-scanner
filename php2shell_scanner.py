@@ -1152,15 +1152,25 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
     pages = 0
     dyn_artifacts: list[str] = []
     def dyn_refs(text: str) -> list[str]:
+        # Order = fetch priority under the js_bundles budget: lang-completed
+        # JOINs first (resolvable to a real file), then JOIN prefix+suffix
+        # (empty-var guess), then bare GETSCRIPT literal LAST (a stub that
+        # almost always 404s — kept only as a parse target, never worth
+        # budget before the completed forms).
         out: list[str] = []
-        for m in GETSCRIPT_RX.finditer(text or ""):
-            out.append(m.group(1))
-        for m in JOIN_RX.finditer(text or ""):
-            out.append(m.group(1) + m.group(2))
         _langs = LANG_DEFAULT_RX.findall(text or "")
         if _langs:
             for m in JOIN_RX.finditer(text or ""):
-                out.append(f"{m.group(1)}{_langs[0]}{m.group(2)}")
+                cand = f"{m.group(1)}{_langs[0]}{m.group(2)}"
+                if cand not in out:
+                    out.append(cand)
+        for m in JOIN_RX.finditer(text or ""):
+            cand = m.group(1) + m.group(2)
+            if cand not in out:
+                out.append(cand)
+        for m in GETSCRIPT_RX.finditer(text or ""):
+            if m.group(1) not in out:
+                out.append(m.group(1))
         return out
     def check_artifacts(dbody: str, ds: str) -> None:
         # StringTable-style content proves server-side PHP (parsed, not executed).
@@ -1205,13 +1215,30 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                         if _p.endswith(".php") and len(_p) < 128:
                             php_targets.add(_p)
                             new_targets.add(_p)
+                        elif _p.endswith(".js") and len(_p) < 128 and _p not in visited:
+                            # browser-observed bundle (incl. runtime-joined
+                            # StringTables): fetch + parse for artifacts even
+                            # when no static or dynamic ref names it.
+                            try:
+                                _jr = http_request(opener, base + _p, timeout)
+                                visited.add(_p)
+                            except Exception:
+                                continue
+                            _jb = _jr.get("body") or ""
+                            for t in extract_links(_jb[:2_000_000]):
+                                if t not in php_targets:
+                                    new_targets.add(t)
+                                    php_targets.add(t)
+                            check_artifacts(_jb, _p)
+                            trace(1, f"spider-cdpjs {_p} ({len(_jb)}B)")
                     except Exception:
                         continue
                 if rhtml or rurls:
                     trace(1, f"spider-cdp {base}{path} rendered={len(rhtml)}B "
                               f"resources={len(rurls)} +{len(new_targets)}php")
             except Exception as e:
-                trace(1, f"spider-cdp {base}{path} unavailable ({type(e).__name__})")
+                trace(1, f"spider-cdp {base}{path} unavailable "
+                          f"({type(e).__name__}: {str(e)[:120]})")
         trace(1, f"spider {base}{path} d={depth} {res.get('status')} "
                   f"({len(body)}B) +{len(new_targets)}php "
                   f"{sorted(new_targets) if new_targets else ''}")
@@ -1294,10 +1321,6 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                 # the bundle ITSELF may load scripts (loader.js getScript for
                 # the StringTable): run dyn_refs on the fetched bundle too.
                 _dyn2 = dyn_refs(jbody[:500_000])
-                for _m in JOIN_RX.finditer(jbody[:500_000]):
-                    _pre = _m.group(1).strip()
-                    if _pre and _pre not in _dyn2:
-                        _dyn2.append(_pre)
                 for ds in _dyn2:
                     if js_fetched >= js_bundles + 2:
                         break

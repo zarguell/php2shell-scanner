@@ -61,7 +61,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 20 local scenarios (18 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 80/80 green (live; match-snippet provenance):
+asserts every verdict live. Last verified 2026-10-22 — 83/83 green (live; match-snippet provenance):
 
 | Service | Image | Result |
 |---|---|---|
@@ -85,7 +85,7 @@ asserts every verdict live. Last verified 2026-10-22 — 80/80 green (live; matc
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (80 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (83 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # trace what the spider saw (stderr; -vv adds every request):

@@ -272,10 +272,20 @@ websocket (`Page.navigate` + `Runtime.evaluate`): rendered
 `documentElement.outerHTML` plus `performance` resource URLs per crawled page.
 That catches what static parsing cannot — e.g. the js-dyn StringTable, which
 the browser loads (`StringTable_en.js` in resources) even though no static
-or dynamic ref names the final URL. Downstream (extract, artifacts, oracle)
-is unchanged: the browser is a richer body supplier. Disabled by default;
-per-page CDP failure falls back to plain HTTP. Verified live against a real
-Chromium (Comet 155): `TestCdpBridge` (skipped without `P2S_CDP`/`--cdp-test`).
+or dynamic ref names the final URL. Resource URLs are now FETCHED through the
+same artifact parser (not just listed): browser-observed bundles join the
+evidence channel like spider-fetched ones. If your Chromium gates `/json/*`
+with 401/403, relaunch with `--remote-debugging-token=...` and pass
+`--cdp-token`. CDP failures log the inner error
+(`unavailable (ConnectionError: …)`), not just the type name.
+Downstream (extract, artifacts, oracle) is unchanged: the browser is a richer
+body supplier. Disabled by default; per-page CDP failure falls back to plain
+HTTP. Verified live against a real Chromium (Comet 155): `TestCdpBridge`
+(skipped without `P2S_CDP`/`--cdp-test`).
+Static-side twin fix in the same pass: JOIN/lang-default candidates are now
+priority-ordered (completed `StringTable_en.js` before bare `StringTable_`
+stubs that 404 as `+php total=0` noise), and resource-URL fetching covers
+browser-observed bundles the static pass never names.
 
 ### Layer G — scheme negotiation: both protocols, upgrades, TLS honesty
 
