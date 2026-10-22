@@ -59,7 +59,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 20 local scenarios (18 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 78/78 green (live; match-snippet provenance):
+asserts every verdict live. Last verified 2026-10-22 — 80/80 green (live; match-snippet provenance):
 
 | Service | Image | Result |
 |---|---|---|
@@ -75,6 +75,7 @@ asserts every verdict live. Last verified 2026-10-22 — 78/78 green (live; matc
 | appliance-fixed (`:19096`) | locked-down panel UI, no PHP headers | PHP_NO_VERSION (Plesk panel + build 18.0.81 → vendor advisory) |
 | deep-surface (`:19097`) | static front, PHP 2 clicks down | VULNERABLE (spider → `/portal/home.php` → oracle 3/3) |
 | js-spa (`:19100`) | SPA, endpoints only in JS bundle | VULNERABLE (bundle → `/api/v2/endpoint.php` → oracle 3/3, no browser) |
+| js-dyn (`:19101`) | StringTable via runtime `+ ".js"` join | PHP_NO_VERSION (loader → StringTable js → `$this->`/`$_SESSION` artifacts, no `.php` URL anywhere) |
 | tls-appliance (`:19098`) | nginx TLS (self-signed) → FPM 8.5.11 | TLS_UNTRUSTED strict (“retry --insecure”); VULNERABLE 3/3 insecure |
 | downgrade-stub (`:19099`) | HTTP 301 → https://:19098 | PHP 8.5.11 found BEHIND the stub (insecure) |
 | silent-errors-off (`:19091`) | php:8.5.11, zero disclosure | PHP_CANNOT_RULE_OUT (dynamic path, points at `--local`) |
@@ -82,7 +83,7 @@ asserts every verdict live. Last verified 2026-10-22 — 78/78 green (live; matc
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (78 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (80 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # trace what the spider saw (stderr; -vv adds every request):

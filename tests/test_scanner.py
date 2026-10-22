@@ -33,6 +33,7 @@ LAB = {  # service -> (port, expected_verdict)
     "appliance-vuln": (19095, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.70 extracted
     "appliance-fixed": (19096, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.81 extracted
     "deep-surface": (19097, "VULNERABLE"),  # spider-only find: PHP 2 clicks down, oracle via /portal/home.php
+    "js-dyn": (19101, "PHP_NO_VERSION"),  # StringTable via runtime JOIN: PHP artifacts proven, no .php surface
     "js-spa": (19100, "VULNERABLE"),  # JS-bundle-only endpoints (?action handler), oracle via /api/v2/endpoint.php
 }
 
@@ -247,6 +248,21 @@ class TestEvidence(unittest.TestCase):
         # method-differential must never call mark() (corroboration only)
         seg = src.split("run_method_differential")[1].split("run_easter_eggs")[0]
         self.assertNotIn("mark(f", seg)
+
+    def test_short_tokens_need_boundaries(self):
+        # user's case: javascript noise / WHMCS must not fire cpanel;
+        # real cPanel login must. matched= names the alternative that fired.
+        self.assertEqual(S.fingerprint_response(
+            {'headers': {}, 'body': '<script>var e="x" type="text/javascript"</script>'})[2], [])
+        sigs = S.fingerprint_response(
+            {'headers': {}, 'body': 'WHMCS billing portal'})[2]
+        self.assertFalse(any(x.startswith("body:app-cpanel") for x in sigs), sigs)
+        self.assertTrue(any(x.startswith("body:app-whmcs") for x in sigs), sigs)
+        sigs2 = S.fingerprint_response(
+            {'headers': {}, 'body': '<title>cPanel Login</title>'})[2]
+        hit = [x for x in sigs2 if x.startswith("body:app-cpanel")]
+        self.assertTrue(hit, sigs2)
+        self.assertIn("matched='cPanel'", hit[0])
 
     def test_snippets_attached(self):
         # sanity check: signal carries matched text + endpoint
@@ -504,6 +520,19 @@ class TestLiveLab(unittest.TestCase):
         self.assertTrue(f.oracle_positive, f.oracle_evidence)
         self.assertIn("8.5.11", f.php_version or "")
 
+    def test_stringtable_dyn_chain(self):
+        # loader.js -> getScript + JOIN with lang default -> StringTable_en.js
+        # whose $this->/$_SESSION content proves server-side PHP. No .php URL
+        # anywhere: verdict rides the artifact evidence, not a path.
+        op = self.opener
+        base = "http://127.0.0.1:19101/"
+        tgts, visited, arts = S.spider_site(op, base, 10)
+        self.assertTrue(any("StringTable_en.js" in a for a in arts), arts)
+        self.assertTrue(any("$this->" in a for a in arts), arts)
+        f = self._scan(19101)
+        self.assertEqual(f.verdict, "PHP_NO_VERSION", f.detail)
+        self.assertTrue(any("dynjs-artifact" in e for e in f.evidence), f.evidence)
+
     def test_js_spa_bundle_only_endpoints(self):
         # index.html has ZERO .php refs; endpoints live in /static/app.js.
         # Bundle fetching must find them, ?action dynamic test must prove,
@@ -511,7 +540,7 @@ class TestLiveLab(unittest.TestCase):
         op = self.opener
         base = "http://127.0.0.1:19100/"
         self.assertEqual(S.harvest_php_links(op, base, 10), [])
-        tgts, visited = S.spider_site(op, base, 10)
+        tgts, visited, _arts = S.spider_site(op, base, 10)
         self.assertIn("/api/v2/endpoint.php", tgts)
         self.assertIn("/portal/deep.php", tgts)
         self.assertIn("/static/app.js", visited)
@@ -555,7 +584,7 @@ class TestLiveLab(unittest.TestCase):
         op = self.opener
         base = "http://127.0.0.1:19097/"
         self.assertEqual(S.harvest_php_links(op, base, 10), [])
-        tgts, visited = S.spider_site(op, base, 10)
+        tgts, visited, _arts = S.spider_site(op, base, 10)
         self.assertIn("/portal/home.php", tgts)
         self.assertIn("/portal/", visited)
         f = self._scan(19097)
@@ -568,11 +597,11 @@ class TestLiveLab(unittest.TestCase):
         # Default and aggressive budgets must both find it.
         op = self.opener
         base = "http://127.0.0.1:19097/"
-        tgts_off, _ = S.spider_site(op, base, 10, max_pages=0, max_depth=0)
+        tgts_off, _, _ = S.spider_site(op, base, 10, max_pages=0, max_depth=0)
         self.assertEqual(tgts_off, set())
-        paths_off = S.discover_php_paths(op, base, 10, 0, 0)
+        paths_off, _ = S.discover_php_paths(op, base, 10, 0, 0)
         self.assertEqual(paths_off, ["/"])
-        paths_on = S.discover_php_paths(op, base, 10)
+        paths_on, _ = S.discover_php_paths(op, base, 10)
         self.assertIn("/portal/home.php", paths_on)
         r = S.scan_endpoint("127.0.0.1", 19097, 10, False, True, False, False,
                             op, 50, 4)

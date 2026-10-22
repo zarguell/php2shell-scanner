@@ -222,7 +222,15 @@ regardless of vendor — plus a harvester that learns the site's own surface:
   flakiness — deliberately not taken. Live proof (`js-spa` lab): index.html
   has ZERO `.php` refs, all routes in `/static/app.js`; bundle fetch finds
   `/api/v2/endpoint.php` + `/portal/deep.php`, `?action` dynamic test proves,
-  oracle 3/3. Known-param probing (`?q/?s/?id/?action/?page/?p`) covers
+  oracle 3/3. Runtime-joined scripts (`"jsAd/StringTable_" + lang + ".js"`): the literal has
+  no extension, so static `.js` harvesting misses it. The spider matches
+  `getScript(`/`loadScript(` calls, reconstructs `prefix + var + ext` joins,
+  completes statically-visible defaults (`|| "en"` → `StringTable_en.js`),
+  resolves page-relative (jQuery semantics), and recurses into fetched bundles
+  (loader loads the table). The fetched StringTable is PARSED for PHP
+  artifacts — your exact shape (`this.php_*`, `$this->`, `$_SESSION`) — which
+  become evidence without any `.php` URL existing. Live proof (`js-dyn` lab).
+  Known-param probing (`?q/?s/?id/?action/?page/?p`) covers
   endpoints that ignore unknown params but consume named ones.
   2+ on an otherwise silent box is recorded for the operator. Deliberately
   NOT a verdict escalator: generic dynamic-handler evidence is not PHP

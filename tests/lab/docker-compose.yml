@@ -229,3 +229,20 @@ services:
       && printf '<?php $$a = $$_GET[\"action\"] ?? \"\"; echo \"api:\" . htmlspecialchars($$a);' > /var/www/html/api/v2/endpoint.php
       && printf '<?php echo \"deep-ok\";' > /var/www/html/portal/deep.php
       && docker-php-entrypoint apache2-foreground"
+  # JS-DYN (StringTable demo): vuln 8.5.11, errors ON, headers stripped.
+  # index.html loads /static/loader.js; the loader pulls
+  # jsAd/StringTable_<lang> + ".js" AT RUNTIME (no static .js ref to it).
+  # The StringTable embeds server-side PHP names ($this->, $_SESSION).
+  # Only bundle-recursion finds it: HTML -> loader.js -> StringTable_en.js.
+  js-dyn:
+    image: php:8.5.11-apache
+    ports: ["19101:80"]
+    volumes:
+      - ./js-dyn/index.html:/var/www/html/index.html:ro
+      - ./js-dyn/loader.js:/var/www/html/static/loader.js:ro
+      - ./js-dyn/stringtable/en.js:/var/www/html/jsAd/StringTable_en.js:ro
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && mkdir -p /var/www/html/api
+      && printf '<?php $$a = $$_GET[\"action\"] ?? \"\"; echo \"dynapi:\" . htmlspecialchars($$a);' > /var/www/html/api/dyn.php
+      && docker-php-entrypoint apache2-foreground"

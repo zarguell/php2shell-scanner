@@ -300,17 +300,24 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], 
     if body:
         if "PHPSESSID" in body:
             i = body.find("PHPSESSID")
-            snippet = re.sub(r"\s+", " ", body[max(0, i-40):i+50]).strip()[:100]
-            signals.append(f"body:PHPSESSID | '{snippet}'")
+            ctx = re.sub(r"\s+", " ", body[max(0, i-30):i+40]).strip()[:110]
+            signals.append(f"body:PHPSESSID matched='PHPSESSID' | '{ctx}'")
         ml = re.search(r'\.php["\'\s>]', body)
         if ml:
-            snippet = re.sub(r"\s+", " ", body[max(0, ml.start()-40):ml.end()+40]).strip()[:100]
-            signals.append(f"body:.php-link | '{snippet}'")
+            ctx = re.sub(r"\s+", " ", body[max(0, ml.start()-30):ml.end()+30]).strip()[:110]
+            signals.append(f"body:.php-link matched='{ml.group(0).strip()}' | '{ctx}'")
         for app, rx in APP_BODY_RX:
             m = rx.search(body)
             if m:
-                snippet = re.sub(r"\s+", " ", body[max(0, m.start()-40):m.end()+40]).strip()[:100]
-                signals.append(f"body:app-{app} | '{snippet}'")
+                hit = m.group(0)
+                ctx = re.sub(r"\s+", " ", body[max(0, m.start()-30):m.end()+30]).strip()[:110]
+                signals.append(f"body:app-{app} matched='{hit}' | '{ctx}'")
+        for aname, arx in PHP_ARTIFACT_RX:
+            am = arx.search(body)
+            if am:
+                hit = am.group(0)
+                ctx = re.sub(r"\s+", " ", body[max(0, am.start()-30):am.end()+30]).strip()[:110]
+                signals.append(f"body:php-artifact-{aname} matched='{hit}' | '{ctx}'")
         m = PHPINFO_VER_RE.search(body)
         if m and version is None:
             version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
@@ -335,7 +342,7 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], 
 # (name, body-regex, well-known probe path returning app-specific content)
 APP_BODY_RX = [
     ("wordpress", re.compile(r"wp-content|wp-includes|/wp-json/|wordpress", re.I)),
-    ("laravel", re.compile(r"laravel|_token|csrf-token", re.I)),
+    ("laravel", re.compile(r"laravel|\b_token\b|\bcsrf-token\b", re.I)),
     ("drupal", re.compile(r"drupal|sites/default/files|Drupal\.settings", re.I)),
     ("joomla", re.compile(r"joomla|/media/jui/|com_content", re.I)),
     ("phpmyadmin", re.compile(r"phpmyadmin|pma_|PhpMyAdmin", re.I)),
@@ -343,23 +350,34 @@ APP_BODY_RX = [
     ("owncloud", re.compile(r"owncloud", re.I)),
     ("mediawiki", re.compile(r"mediawiki|mw-config|/load\.php", re.I)),
     ("symfony", re.compile(r"symfony|_wdt|/bundles/", re.I)),
-    ("codeigniter", re.compile(r"codeigniter|ci_session", re.I)),
-    ("magento", re.compile(r"magento|/static/version|mage/cookies", re.I)),
+    ("codeigniter", re.compile(r"codeigniter|\bci_session\b", re.I)),
+    ("magento", re.compile(r"magento|/static/version|\bmage/cookies\b", re.I)),
     ("prestashop", re.compile(r"prestashop", re.I)),
-    ("matomo", re.compile(r"matomo|piwik", re.I)),
+    ("matomo", re.compile(r"matomo|\bpiwik\b", re.I)),
     # Hosting panels (PHP UIs; version = panel build, PHP runtime underneath).
     ("plesk", re.compile(r"plesk|sw-cp-server|psa-page", re.I)),
-    ("cpanel", re.compile(r"cPanel|WHM|cpanel.*login|/cpsess", re.I)),
+    ("cpanel", re.compile(r"cPanel|\bWHM\b|cpanel.*login|/cpsess", re.I)),
     ("whmcs", re.compile(r"whmcs|WHMCompleteSolution", re.I)),
     ("passbolt", re.compile(r"passbolt", re.I)),
     ("coolify", re.compile(r"coolify", re.I)),
     # Network/security appliances with PHP management UIs.
-    ("panos", re.compile(r"pan-os|panorama|palo\s?alto", re.I)),
+    ("panos", re.compile(r"pan-os|panorama|\bpalo\s?alto\b", re.I)),
     ("pfsense", re.compile(r"pfSense", re.I)),
     ("opnsense", re.compile(r"OPNsense", re.I)),
     ("synology", re.compile(r"synology|diskstation", re.I)),
-    ("qnap", re.compile(r"qnap|QTS", re.I)),
+    ("qnap", re.compile(r"qnap|\bQTS\b", re.I)),
     ("freenas", re.compile(r"freenas|truenas", re.I)),
+]
+
+# PHP code artifacts leaked into served content (error output, source
+# disclosure, JS stringtables embedding server-side names). Each pattern is
+# PHP-syntax-specific: measured zero hits on JS/CSS/HTML noise corpora.
+PHP_ARTIFACT_RX = [
+    ("this-arrow", re.compile(r"\$this->[a-z_]+", re.I)),
+    ("scope-resolution", re.compile(r"[A-Za-z_\\]+::[a-z_]+")),
+    ("php-echo-tag", re.compile(r"<\?php\s+echo", re.I)),
+    ("superglobal", re.compile(r"\$_(GET|POST|SERVER|SESSION|COOKIE|FILES|REQUEST)\b")),
+    ("stringtable-php", re.compile(r"this\.php_", re.I)),
 ]
 
 # Safe active probes: each is a normal GET a browser/crawler would issue.
@@ -450,7 +468,8 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
 
 
 def discover_php_paths(opener, url: str, timeout: float,
-                       spider_pages: int = 10, spider_depth: int = 2) -> list[str]:
+                       spider_pages: int = 10, spider_depth: int = 2
+                       ) -> tuple[list[str], list[str]]:
     """GET each candidate path; return paths proving PHP execution.
     Candidates = bounded spider crawl (site's own links, spider_depth clicks
     down, spider_pages cap) + static guesses + conventional fallbacks.
@@ -460,10 +479,10 @@ def discover_php_paths(opener, url: str, timeout: float,
     found: list[str] = []
     probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
     try:
-        spider_targets, _ = spider_site(opener, url, min(timeout, 6.0),
-                                        max_pages=spider_pages, max_depth=spider_depth)
+        spider_targets, _, _dyn_art = spider_site(opener, url, min(timeout, 6.0),
+                                                  max_pages=spider_pages, max_depth=spider_depth)
     except Exception:
-        spider_targets = set()
+        spider_targets, _dyn_art = set(), []
     try:
         crawled = harvest_php_links(opener, url, timeout)
     except Exception:
@@ -510,7 +529,7 @@ def discover_php_paths(opener, url: str, timeout: float,
             continue
     # / always tried (oracle is harmless); discovered .php paths added
     paths = ["/"] + [p for p in found if p != "/"]
-    return paths
+    return paths, _dyn_art
 
 
 # LFI sink discovery: candidate (path, param) pairs where a query parameter
@@ -552,7 +571,7 @@ def discover_lfi_sinks(opener, url: str, timeout: float,
     base = url.rstrip("/")
     if php_paths is None:
         try:
-            php_paths = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
+            php_paths, _ = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
         except Exception:
             php_paths = ["/"]
     # candidate params: site's own form inputs + conventional names
@@ -631,7 +650,7 @@ def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
     base = url.rstrip("/")
     last_ev = "not run"
     try:
-        paths = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
+        paths, _ = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
     except Exception:
         paths = list(ORACLE_PATHS)
     for p in paths:
@@ -894,10 +913,14 @@ def harvest_php_links(opener, url: str, timeout: float,
 
 
 def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
-                max_depth: int = 2, js_bundles: int = 3) -> tuple[set[str], set[str]]:
+                max_depth: int = 2, js_bundles: int = 3
+                ) -> tuple[set[str], set[str], list[str]]:
     """Bounded BFS crawl for PHP surface. Returns (php_targets, visited).
     Seeds at `/`; follows same-origin HTML links (any href, not just .php)
     to `max_depth`; every visited page contributes extract_links() hits.
+    Returns (php_targets, visited, dyn_artifacts): dyn_artifacts are evidence
+    strings for dynamically-fetched bodies (StringTables) whose CONTENT proves
+    server-side PHP (parsed, not executed).
     Plus: up to js_bundles referenced same-origin `.js` files per site are
     fetched and parsed for endpoint literals (this is the no-browser answer
     to JS-rendered apps — endpoint NAMES live in bundle source text; a
@@ -913,8 +936,36 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
     queue: list[tuple[str, int]] = [("/", 0)]
     HREF_RX = re.compile(r'''href\s*=\s*["']([^"'#>]+)["']''', re.I)
     JS_SRC_RX = re.compile(r'''<script[^>]+src\s*=\s*["']([^"'#>]+?\.js)\b''', re.I)
+    # Dynamic script loads with NO .js extension ($.getScript("jsAd/StringTable_X"),
+    # loadScript("/assets/boot")): the StringTable lives behind these. JOIN covers
+    # "prefix" + var + ".js" runtime-concat builds (lang default completed below).
+    GETSCRIPT_RX = re.compile(r'''(?:getScript|loadScript|importScripts|\.ajax)\s*\(\s*["']([^"'#?]+)["']''', re.I)
+    JOIN_RX = re.compile(r'''["']([^"']{1,80}?)[/]?["']\s*\+\s*[A-Za-z_$][\w$]*\s*\+\s*["'](\.[a-z]{1,5})["']''')
+    LANG_DEFAULT_RX = re.compile(r'''\|\|\s*["']([a-z]{2})["']''')
     js_fetched = 0
     pages = 0
+    dyn_artifacts: list[str] = []
+    def dyn_refs(text: str) -> list[str]:
+        out: list[str] = []
+        for m in GETSCRIPT_RX.finditer(text or ""):
+            out.append(m.group(1))
+        for m in JOIN_RX.finditer(text or ""):
+            out.append(m.group(1) + m.group(2))
+        _langs = LANG_DEFAULT_RX.findall(text or "")
+        if _langs:
+            for m in JOIN_RX.finditer(text or ""):
+                out.append(f"{m.group(1)}{_langs[0]}{m.group(2)}")
+        return out
+    def check_artifacts(dbody: str, ds: str) -> None:
+        # StringTable-style content proves server-side PHP (parsed, not executed).
+        for aname, arx in PHP_ARTIFACT_RX:
+            am = arx.search(dbody[:500_000])
+            if am:
+                hit = am.group(0)
+                ctx = re.sub(r"\s+", " ", dbody[max(0, am.start()-30):am.end()+30]).strip()[:110]
+                dyn_artifacts.append(f"spider-dynjs-artifact:{ds} matched='{hit}' | '{ctx}'")
+                trace(1, f"spider-dynjs {ds} ARTIFACT {hit}")
+                break
     while queue and pages < max_pages:
         path, depth = queue.pop(0)
         if path in visited:
@@ -935,8 +986,46 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                   f"{sorted(new_targets) if new_targets else ''}")
         # JS bundles: fetch up to js_bundles same-origin .js files site-wide
         # and parse for endpoint literals (Vue/Angular/React apps ship their
-        # API map in bundle source — no browser needed to read it).
-        if js_fetched < js_bundles and "html" in ctype:
+        # API map in bundle source — no browser needed to read it). Dynamic
+        # refs (getScript/JOIN, no .js ext) run on EVERY fetched body: HTML
+        # pages AND .js bundles (loader.js loads the StringTable itself).
+        # getScript refs resolve against the SITE ROOT (jQuery resolves
+        # against the document, not the script URL).
+        if js_fetched < js_bundles and ("html" in ctype or "javascript" in ctype):
+            # (a) dynamic refs first: getScript/JOIN/lang-default, resolved
+            # against the SITE ROOT (jQuery resolves against the document).
+            for src in dyn_refs(body):
+                if js_fetched >= js_bundles + 2:
+                    break
+                src = src.split("?")[0].strip()
+                if not src or src.startswith(("http", "//", "data:")):
+                    if src.startswith("http"):
+                        try:
+                            u = urlparse(src)
+                            if u.hostname != host:
+                                continue
+                            src = u.path or ""
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                if not src or len(src) >= 128 or src in visited:
+                    continue
+                try:
+                    dr = http_request(opener, urljoin(base + "/", src), timeout)
+                    visited.add(src)
+                    js_fetched += 1
+                except Exception:
+                    continue
+                dbody = dr.get("body") or ""
+                for t in extract_links(dbody[:2_000_000]):
+                    if t not in php_targets:
+                        new_targets.add(t)
+                        php_targets.add(t)
+                check_artifacts(dbody, src)
+                for t in dyn_refs(dbody[:500_000]):
+                    pass  # depth cap: logged via check_artifacts callers only
+                trace(1, f"spider-dynjs {src} ({len(dbody)}B) +php total={len(php_targets)}")
             for jm in JS_SRC_RX.finditer(body):
                 if js_fetched >= js_bundles:
                     break
@@ -970,6 +1059,33 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                     if t not in php_targets:
                         new_targets.add(t)
                         php_targets.add(t)
+                check_artifacts(jbody, full)
+                # the bundle ITSELF may load scripts (loader.js getScript for
+                # the StringTable): run dyn_refs on the fetched bundle too.
+                _dyn2 = dyn_refs(jbody[:500_000])
+                for _m in JOIN_RX.finditer(jbody[:500_000]):
+                    _pre = _m.group(1).strip()
+                    if _pre and _pre not in _dyn2:
+                        _dyn2.append(_pre)
+                for ds in _dyn2:
+                    if js_fetched >= js_bundles + 2:
+                        break
+                    ds = ds.split("?")[0].strip()
+                    if not ds or len(ds) >= 128 or ds in visited:
+                        continue
+                    try:
+                        dr = http_request(opener, urljoin(base + "/", ds), timeout)
+                        visited.add(ds)
+                        js_fetched += 1
+                    except Exception:
+                        continue
+                    dbody = dr.get("body") or ""
+                    for t in extract_links(dbody[:2_000_000]):
+                        if t not in php_targets:
+                            new_targets.add(t)
+                            php_targets.add(t)
+                    check_artifacts(dbody, ds)
+                    trace(1, f"spider-dynjs {ds} ({len(dbody)}B) +php total={len(php_targets)}")
                 trace(1, f"spider-js {full} ({len(jbody)}B) "
                           f"+{len(new_targets)}php total={len(php_targets)}")
         for m in HREF_RX.finditer(body):
@@ -997,7 +1113,7 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
             # keep the trailing slash so the fetch hits the same resource
             if len(href) < 128 and href not in visited:
                 queue.append((href, depth + 1))
-    return php_targets, visited
+    return php_targets, visited, dyn_artifacts
 
 
 # ---------------------------------------------------------------- model
@@ -1249,8 +1365,11 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
                 # surface which paths proved PHP execution even when silent
                 try:
-                    f.discovered_paths = discover_php_paths(opener, url, timeout,
-                                                           spider_pages, spider_depth)[1:]
+                    _paths, _art = discover_php_paths(opener, url, timeout,
+                                                      spider_pages, spider_depth)
+                    f.discovered_paths = _paths[1:]
+                    for _sig in _art:
+                        mark(f, _sig)
                 except Exception:
                     pass
             except Exception as e:
