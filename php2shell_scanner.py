@@ -983,6 +983,33 @@ def parse_cdp_endpoint(cdp: str) -> tuple[str, int]:
     return host, port
 
 
+def _cdp_ws_handshake(sock: socket.socket, path: str, host: str, token: str = "") -> bytes:
+    """RFC 6455 client handshake, deliberately WITHOUT an Origin header.
+    Gated Chromium (--remote-allow-origins guard) answers origin-less
+    same-host upgrades but 403s explicit origins it does not allowlist
+    (observed: "Rejected an incoming WebSocket connection"). Bearer auth
+    rides alongside when --cdp-token is set. Returns the raw response head
+    so callers can assert 101."""
+    import base64 as _b64h
+    _key = _b64h.b64encode(bytes(__import__("os").urandom(16))).decode()
+    _auth = f"Authorization: Bearer {token}\r\n" if token else ""
+    # No Origin header: an explicit Origin (even http://127.0.0.1) trips
+    # --remote-allow-origins guards on gated builds AND on default-deny
+    # Chromium (observed: 403 "Rejected an incoming WebSocket connection").
+    # Origin-less same-host upgrades are the broadly-compatible shape.
+    sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                  f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                  f"Sec-WebSocket-Key: {_key}\r\nSec-WebSocket-Version: 13\r\n"
+                  f"{_auth}\r\n".encode())
+    _head = b""
+    while b"\r\n\r\n" not in _head:
+        _chunk = sock.recv(4096)
+        if not _chunk:
+            break
+        _head += _chunk
+    return _head
+
+
 def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
                    ) -> tuple[socket.socket, str, str]:
     """Open a CDP target session: GET /json/new -> webSocketDebuggerUrl ->
@@ -1038,17 +1065,9 @@ def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
     wpath = u.path + (("?" + u.query) if u.query else "")
     raw = socket.create_connection((host, u.port or port), timeout=timeout)
     raw.settimeout(timeout)
-    key = _b64.b64encode(bytes(__import__("os").urandom(16))).decode()
-    auth_line = f"Authorization: Bearer {token}\r\n" if token else ""
-    raw.sendall(f"GET {wpath} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                f"Sec-WebSocket-Version: 13\r\n{auth_line}\r\n".encode())
-    head = b""
-    while b"\r\n\r\n" not in head:
-        chunk = raw.recv(4096)
-        if not chunk:
-            raise ConnectionError("CDP handshake: connection closed")
-        head += chunk
+    head = _cdp_ws_handshake(raw, wpath, host, token)
+    if not head:
+        raise ConnectionError("CDP handshake: connection closed")
     if b" 101 " not in head.split(b"\r\n", 1)[0]:
         raise ConnectionError(f"CDP handshake rejected: {head[:80]!r}")
     return raw, target_id, ws_url
@@ -1072,17 +1091,9 @@ def cdp_ws_page_socket(host: str, port: int, target_id: str, timeout: float,
     _raw = socket.create_connection((host, _u.port or port if ws_url else port),
                                      timeout=timeout)
     _raw.settimeout(timeout)
-    _key = _b64p.b64encode(bytes(__import__("os").urandom(16))).decode()
-    _auth = f"Authorization: Bearer {token}\r\n" if token else ""
-    _raw.sendall(f"GET {_path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {_key}\r\n"
-                  f"Sec-WebSocket-Version: 13\r\n{_auth}\r\n".encode())
-    _head = b""
-    while b"\r\n\r\n" not in _head:
-        _chunk = _raw.recv(4096)
-        if not _chunk:
-            raise ConnectionError("CDP page handshake: connection closed")
-        _head += _chunk
+    _head = _cdp_ws_handshake(_raw, _path, host, token)
+    if not _head:
+        raise ConnectionError("CDP page handshake: connection closed")
     if b" 101 " not in _head.split(b"\r\n", 1)[0]:
         raise ConnectionError(f"CDP page handshake rejected: {_head[:80]!r}")
     return _raw
@@ -1119,17 +1130,9 @@ def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
     import base64 as _b64b
     _raw = socket.create_connection((host, _u.port or port), timeout=timeout)
     _raw.settimeout(timeout)
-    _key = _b64b.b64encode(bytes(__import__("os").urandom(16))).decode()
-    _auth = f"Authorization: Bearer {token}\r\n" if token else ""
-    _raw.sendall(f"GET {_path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {_key}\r\n"
-                  f"Sec-WebSocket-Version: 13\r\n{_auth}\r\n".encode())
-    _head = b""
-    while b"\r\n\r\n" not in _head:
-        _chunk = _raw.recv(4096)
-        if not _chunk:
-            raise ConnectionError("CDP browser handshake: connection closed")
-        _head += _chunk
+    _head = _cdp_ws_handshake(_raw, _path, host, token)
+    if not _head:
+        raise ConnectionError("CDP browser handshake: connection closed")
     if b" 101 " not in _head.split(b"\r\n", 1)[0]:
         raise ConnectionError(f"CDP browser handshake rejected: {_head[:80]!r}")
     _mid = [0]
@@ -1143,17 +1146,16 @@ def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
 
 def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
                       token: str = "", page_ws_url: str = "") -> tuple[socket.socket, socket.socket, object, str, str]:
-    """One correctly-scoped driver for a page target. Returns
-    (page_sock, browser_sock, call, sessionId, attach_note) where call(method,
-    params) sends Page/Runtime/Network methods session-scoped over the page
-    socket. attach_note is "" on success, else the raw attach failure (reply
-    text or exception — surfaced by --cdp-doctor so strict-build behavior is
-    diagnosable, never a bare 'no sessionId').
-    Strict builds route Target.* ONLY on the browser session and Page.* ONLY
-    with the attach sessionId; lenient builds accept either, so this shape
-    works everywhere. attach runs over the browser session with a 5s deadline
-    (never the full timeout); on attach failure sessionId is "" and calls go
-    sessionless (lenient-build behavior). Caller closes BOTH sockets."""
+    """Single-socket driver: EVERYTHING over the browser session.
+    attachToTarget (browser socket) -> sessionId at the top-level message
+    envelope -> Page/Runtime/Network over the SAME browser socket.
+    The page socket is kept only as a fallback probe (some builds scope Page.*
+    to it); call() tries the browser socket first and fails over to the page
+    socket with the same envelope. Returns
+    (page_sock_or_None, browser_sock, call, sessionId, attach_note).
+    attach_note is "" on success, else the raw attach failure (reply text or
+    exception — surfaced by --cdp-doctor so strict-build behavior is
+    diagnosable, never a bare 'no sessionId'). Caller closes BOTH sockets."""
     import http.client as _hc3
     import json as _js3
     from urllib.parse import urlparse as _up3
@@ -1176,20 +1178,11 @@ def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
         raise ConnectionError("CDP /json/version returned no webSocketDebuggerUrl")
     _u = _up3(_ws)
     _bpath = _u.path + (("?" + _u.query) if _u.query else "")
-    import base64 as _b64c
     _bsock = socket.create_connection((host, _u.port or port), timeout=timeout)
     _bsock.settimeout(timeout)
-    _bkey = _b64c.b64encode(bytes(__import__("os").urandom(16))).decode()
-    _bauth = f"Authorization: Bearer {token}\r\n" if token else ""
-    _bsock.sendall(f"GET {_bpath} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-                    f"Connection: Upgrade\r\nSec-WebSocket-Key: {_bkey}\r\n"
-                    f"Sec-WebSocket-Version: 13\r\n{_bauth}\r\n".encode())
-    _bhead = b""
-    while b"\r\n\r\n" not in _bhead:
-        _chunk = _bsock.recv(4096)
-        if not _chunk:
-            raise ConnectionError("CDP browser handshake: connection closed")
-        _bhead += _chunk
+    _bhead = _cdp_ws_handshake(_bsock, _bpath, host, token)
+    if not _bhead:
+        raise ConnectionError("CDP browser handshake: connection closed")
     if b" 101 " not in _bhead.split(b"\r\n", 1)[0]:
         raise ConnectionError(f"CDP browser handshake rejected: {_bhead[:80]!r}")
     _bmid = [0]
@@ -1213,16 +1206,37 @@ def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
     except Exception as _e:
         _attach_note = f"{type(_e).__name__}: {str(_e)[:160]}"
         trace(1, f"cdp attach failed: {_attach_note}")
-    _psock = cdp_ws_page_socket(host, port, target_id, timeout, token, page_ws_url)
+    _psock = None
+    try:
+        _psock = cdp_ws_page_socket(host, port, target_id, timeout, token, page_ws_url)
+    except Exception as _e:
+        trace(2, f"cdp page socket unavailable ({type(_e).__name__}), browser socket only")
     _pmid = [0]
 
-    def _call(method: str, params: dict | None = None) -> dict:
+    def _one(_sock, method: str, params: dict | None) -> dict:
         _pmid[0] += 1
-        _p = dict(params or {})
+        _msg: dict = {"id": _pmid[0], "method": method,
+                      "params": dict(params or {})}
         if _sid:
-            _p["sessionId"] = _sid
-        return cdp_send(_psock, {"id": _pmid[0], "method": method,
-                                 "params": _p}, timeout)
+            _msg["sessionId"] = _sid  # top-level envelope (NOT params):
+            # strict builds reject params.sessionId with -32000 Not allowed.
+        return cdp_send(_sock, _msg, timeout)
+
+    def _call(method: str, params: dict | None = None) -> dict:
+        # Browser socket FIRST (proven: envelope-scoped Page.* works there on
+        # lenient AND strict builds). Page socket is the fallback for builds
+        # that scope Page.* to the target connection.
+        try:
+            return _one(_bsock, method, params)
+        except Exception as _e:
+            _err = str(_e)
+            _retriable = ("Session with given id not found" in _err
+                          or "wasn't found" in _err
+                          or isinstance(_e, TimeoutError))
+            if _psock is None or not _retriable:
+                raise
+            trace(2, f"cdp {method} via page socket after browser-scope miss")
+            return _one(_psock, method, params)
     return _psock, _bsock, _call, _sid, _attach_note
 
 
@@ -1323,11 +1337,11 @@ def cdp_session(sock: socket.socket, target_id: str, timeout: float
 
     def call(method: str, params: dict | None = None) -> dict:
         _mid[0] += 1
-        _p = dict(params or {})
+        _msg: dict = {"id": _mid[0], "method": method,
+                      "params": dict(params or {})}
         if _sid:
-            _p["sessionId"] = _sid
-        return cdp_send(sock, {"id": _mid[0], "method": method,
-                               "params": _p}, timeout)
+            _msg["sessionId"] = _sid  # top-level envelope, never params.
+        return cdp_send(sock, _msg, timeout)
     return _sid, call
 
 

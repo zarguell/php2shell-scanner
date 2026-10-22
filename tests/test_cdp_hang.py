@@ -88,7 +88,8 @@ def _serve_strict_browser(port: int, hang_page: bool, started: "_th.Event",
             except Exception:
                 return
             method = msg.get("method", "")
-            log.append((name, method))
+            log.append((name, method, "sess" if "sessionId" in msg else "nosess",
+                        "paramssess" if "sessionId" in msg.get("params", {}) else ""))
             if hang_all:
                 continue  # strict build: silent drop, no error
             if method == "Target.getTargets":
@@ -97,6 +98,15 @@ def _serve_strict_browser(port: int, hang_page: bool, started: "_th.Event",
             elif method == "Target.attachToTarget":
                 r = _js.dumps({"id": msg.get("id"), "result": {
                     "sessionId": "SESS1"}}).encode()
+            elif name == "browser" and method.startswith(("Page.", "Runtime.", "Network.")):
+                # strict rule: session-scoped calls belong on the browser
+                # socket with sessionId at the TOP LEVEL envelope.
+                if msg.get("sessionId") != "SESS1":
+                    r = _js.dumps({"id": msg.get("id"), "error": {
+                        "code": -32000,
+                        "message": "Not allowed"}}).encode()
+                else:
+                    r = _js.dumps({"id": msg.get("id"), "result": {}}).encode()
             else:
                 r = _js.dumps({"id": msg.get("id"), "result": {}}).encode()
             conn.sendall(_frame(r))
@@ -161,11 +171,10 @@ def _serve_strict_browser(port: int, hang_page: bool, started: "_th.Event",
 class TestCdpHang(unittest.TestCase):
     def test_scoped_driver_survives_strict_build(self):
         # Full strict-build reproduction: page socket hangs everything, browser
-        # session answers. cdp_scoped_driver must attach over the browser
-        # session and drive Page.enable session-scoped over the page socket —
-        # here the page socket hangs, so Page.enable must raise TimeoutError
-        # NAMING the method (diagnosable), not hang forever. And with
-        # hang_page=False the same driver must succeed end to end.
+        # session answers Target.* AND session-enveloped Page.* (top-level
+        # sessionId; params-scoped yields -32000 Not allowed). The driver must
+        # succeed end to end via the browser socket in BOTH modes — hang=True
+        # proves the page socket is never needed for Page.*.
         for hang, port in ((True, 19296), (False, 19295)):
             started = _th.Event()
             log: list = []
@@ -184,25 +193,17 @@ class TestCdpHang(unittest.TestCase):
                         sock.close()
                     except Exception:
                         pass
-                if hang:
-                    # attach runs over the BROWSER socket (answers) -> SESS1;
-                    # the PAGE socket hangs everything (reporter's build), so
-                    # Page.enable must raise TimeoutError NAMING the method —
-                    # the doctor reports 'not drivable', never a bare hang.
-                    self.assertEqual(sess, "SESS1")
-                    with self.assertRaises(TimeoutError) as cm:
-                        S.cdp_send(psock, {"id": 99, "method": "Page.enable",
-                                           "params": {"sessionId": sess}}, 12,
-                                   call_timeout=2.0)
-                    self.assertIn("Page.enable", str(cm.exception))
-                else:
-                    self.assertEqual(sess, "SESS1")
-                    r = call("Page.enable")
-                    self.assertIn("result", r)
-                    # sessionId actually prefixed on the wire
-                    self.assertTrue(
-                        any(m == "Page.enable" for _, m in log),
-                        f"Page.enable never reached fake browser: {log}")
+                self.assertEqual(sess, "SESS1")
+                r = call("Page.enable")
+                self.assertIn("result", r)
+                # sessionId at the TOP LEVEL envelope on the browser socket —
+                # never inside params (strict rejects that with -32000).
+                hits = [e for e in log if e[1] == "Page.enable"]
+                self.assertTrue(hits, f"Page.enable never reached fake browser: {log}")
+                self.assertTrue(all(h[2] == "sess" for h in hits),
+                                f"sessionId missing at envelope: {log}")
+                self.assertTrue(all(h[3] == "" for h in hits),
+                                f"sessionId leaked into params: {log}")
             finally:
                 for _s in (psock, bsock):
                     try:
