@@ -361,16 +361,19 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
     return False
 
 
-def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
+def discover_php_paths(opener, url: str, timeout: float,
+                       spider_pages: int = 10, spider_depth: int = 2) -> list[str]:
     """GET each candidate path; return paths proving PHP execution.
-    Candidates = bounded spider crawl (site's own links, 1-2 clicks down) +
-    static guesses + conventional fallbacks. Proof = X-Powered-By PHP,
-    PHPSESSID cookie, .php redirect, or dynamic query reflection. All safe GETs."""
+    Candidates = bounded spider crawl (site's own links, spider_depth clicks
+    down, spider_pages cap) + static guesses + conventional fallbacks.
+    Proof = X-Powered-By PHP, PHPSESSID cookie, .php redirect, or dynamic
+    query reflection. All safe GETs."""
     base = url.rstrip("/")
     found: list[str] = []
     probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
     try:
-        spider_targets, _ = spider_site(opener, url, min(timeout, 6.0))
+        spider_targets, _ = spider_site(opener, url, min(timeout, 6.0),
+                                        max_pages=spider_pages, max_depth=spider_depth)
     except Exception:
         spider_targets = set()
     try:
@@ -412,7 +415,8 @@ def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
     return paths
 
 
-def run_oracle(opener, url: str, timeout: float) -> tuple[bool, str]:
+def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
+               spider_depth: int = 2) -> tuple[bool, str]:
     """Return (positive, evidence). Discovers PHP-executing paths via safe
     GETs (site's own harvested .php links first, then static guesses), then
     POSTs the tiny oracle to each. Positive requires ALL THREE markers on any
@@ -420,7 +424,7 @@ def run_oracle(opener, url: str, timeout: float) -> tuple[bool, str]:
     base = url.rstrip("/")
     last_ev = "not run"
     try:
-        paths = discover_php_paths(opener, url, timeout)
+        paths = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
     except Exception:
         paths = list(ORACLE_PATHS)
     for p in paths:
@@ -862,7 +866,8 @@ def reverse_lookup(ip: str) -> str | None:
 
 def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   do_oracle: bool, phpinfo: bool, want_ptr: bool,
-                  opener: urllib.request.OpenerDirector) -> list[Finding]:
+                  opener: urllib.request.OpenerDirector,
+                  spider_pages: int = 10, spider_depth: int = 2) -> list[Finding]:
     schemes = ["https"] if port == 443 else ["http"] if port == 80 else ["http", "https"]
     out: list[Finding] = []
     for scheme in schemes:
@@ -922,11 +927,12 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                         break
         if do_oracle:
             try:
-                pos, ev = run_oracle(opener, url, timeout)
+                pos, ev = run_oracle(opener, url, timeout, spider_pages, spider_depth)
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
                 # surface which paths proved PHP execution even when silent
                 try:
-                    f.discovered_paths = discover_php_paths(opener, url, timeout)[1:]
+                    f.discovered_paths = discover_php_paths(opener, url, timeout,
+                                                           spider_pages, spider_depth)[1:]
                 except Exception:
                     pass
             except Exception as e:
@@ -1129,6 +1135,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="on-box enumeration: list local php binaries/versions/SAPIs/processes (run ON the host)")
     ap.add_argument("--timeout", type=float, default=8.0)
     ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--spider-pages", type=int, default=10,
+                    help="max pages the site spider fetches per endpoint (default 10; 0 disables crawl, single-page harvest only)")
+    ap.add_argument("--spider-depth", type=int, default=2,
+                    help="max crawl depth from / (default 2). Aggressive: --spider-pages 50 --spider-depth 4")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (labs/self-signed)")
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("-o", "--output", help="write results (JSON) to file")
@@ -1180,9 +1190,12 @@ def main(argv: list[str] | None = None) -> int:
         jobs = [(h, p) for h in hosts for p in ports]
 
     findings: list[Finding] = []
+    spider_pages = max(0, args.spider_pages)
+    spider_depth = max(0, args.spider_depth)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {ex.submit(scan_endpoint, h, p, args.timeout, args.insecure,
-                          do_oracle, args.phpinfo, args.reverse_dns, opener): (h, p)
+                          do_oracle, args.phpinfo, args.reverse_dns, opener,
+                          spider_pages, spider_depth): (h, p)
                 for h, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             try:

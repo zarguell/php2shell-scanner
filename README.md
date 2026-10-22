@@ -45,12 +45,10 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 |---|---|
 | `target` / `-f FILE` / `-s CIDR` | single host, file list, or subnet |
 | `-p PORTS` / `--discover-ports` | explicit ports (`80,8080,9000-9010`) or probe common web ports |
-| `--no-oracle` | skip active probe (passive fingerprint only) |
-| `--phpinfo` | also check common phpinfo paths for version disclosure |
 | `--reverse-dns` | PTR lookup per target |
 | `--local` | on-box enumeration: php binaries/versions/SAPIs/processes (run ON the host) |
+| `--spider-pages N` (default 10) / `--spider-depth D` (default 2) | site-crawl budget per endpoint. `0/0` = single-page harvest only (quietest); aggressive: `--spider-pages 50 --spider-depth 4` |
 | `--insecure` | skip TLS verification (self-signed labs) |
-| `--json` / `-o FILE` | JSON stdout / write JSON report |
 | `--timeout`, `--threads` | per-request seconds (default 8), concurrency (default 16) |
 
 Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·

@@ -348,6 +348,23 @@ class TestLiveLab(unittest.TestCase):
         self.assertEqual(f.verdict, "VULNERABLE", f.detail)
         self.assertIn("/portal/home.php", f.oracle_evidence)
 
+    def test_spider_budget_flags(self):
+        # --spider-pages 0 --spider-depth 0 disables the crawl: the deep
+        # surface (2 clicks down, no static guesses hit) must go silent.
+        # Default and aggressive budgets must both find it.
+        op = self.opener
+        base = "http://127.0.0.1:19097/"
+        tgts_off, _ = S.spider_site(op, base, 10, max_pages=0, max_depth=0)
+        self.assertEqual(tgts_off, set())
+        paths_off = S.discover_php_paths(op, base, 10, 0, 0)
+        self.assertEqual(paths_off, ["/"])
+        paths_on = S.discover_php_paths(op, base, 10)
+        self.assertIn("/portal/home.php", paths_on)
+        r = S.scan_endpoint("127.0.0.1", 19097, 10, False, True, False, False,
+                            op, 50, 4)
+        self.assertTrue(r, "aggressive scan returned no findings")
+        self.assertEqual(r[0].verdict, "VULNERABLE", r[0].detail)
+
     def test_appliance_twins_attributed_with_build(self):
         # Locked-down panel UIs, no PHP headers: scanner must attribute the
         # PHP-backed panel + extract the panel build for advisory lookup.

@@ -213,7 +213,12 @@ regardless of vendor — plus a harvester that learns the site's own surface:
   `/portal/` → `/portal/home.php` (dynamic `?q` handler); single-page
   harvest `[]`, spider `['/portal/home.php']`, oracle 3/3 there. Budget ~11
   GETs worst case; plain GETs only, no state change.
-- **Behavioral corroboration count.** Cookie/egg/404 signals each add one;
+  Budget is user-tunable: `--spider-pages N --spider-depth D` (defaults
+  10/2). `--spider-pages 0 --spider-depth 0` disables the crawl (single-page
+  harvest only — quietest; deep surface goes silent, pinned in tests).
+  Aggressive `--spider-pages 50 --spider-depth 4` crawls deeper at ~50 GETs.
+  Verified live: default and aggressive both fire on the deep-surface lab,
+  disabled goes `NO_PHP_SIGNAL`.
   2+ on an otherwise silent box is recorded for the operator. Deliberately
   NOT a verdict escalator: generic dynamic-handler evidence is not PHP
   evidence, and the obscure-pair test pins that NO_PHP_SIGNAL stands.
