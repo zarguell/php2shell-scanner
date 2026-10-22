@@ -1052,6 +1052,59 @@ def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
     return raw, target_id
 
 
+def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
+                        ) -> tuple[socket.socket, object]:
+    """Browser-level CDP session (/json/version -> /devtools/browser/...).
+    Target.* methods (getTargets, createTarget, attachToTarget) belong HERE,
+    not on a page session — strict builds silently drop them on page sessions
+    (hang with no error). Returns (socket, call). Caller closes the socket."""
+    import http.client as _hc2
+    import json as _js2
+    from urllib.parse import urlparse as _up2
+    _c = _hc2.HTTPConnection(host, port, timeout=timeout)
+    _hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+    _c.request("GET", "/json/version", headers=_hdrs)
+    _r = _c.getresponse()
+    if _r.status != 200:
+        try:
+            _c.close()
+        except Exception:
+            pass
+        raise ConnectionError(f"CDP /json/version -> HTTP {_r.status}")
+    _ws = _js2.loads(_r.read().decode("utf-8", "replace")).get("webSocketDebuggerUrl", "")
+    try:
+        _c.close()
+    except Exception:
+        pass
+    if not _ws:
+        raise ConnectionError("CDP /json/version returned no webSocketDebuggerUrl")
+    _u = _up2(_ws)
+    _path = _u.path + (("?" + _u.query) if _u.query else "")
+    import base64 as _b64b
+    _raw = socket.create_connection((host, _u.port or port), timeout=timeout)
+    _raw.settimeout(timeout)
+    _key = _b64b.b64encode(bytes(__import__("os").urandom(16))).decode()
+    _auth = f"Authorization: Bearer {token}\r\n" if token else ""
+    _raw.sendall(f"GET {_path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {_key}\r\n"
+                  f"Sec-WebSocket-Version: 13\r\n{_auth}\r\n".encode())
+    _head = b""
+    while b"\r\n\r\n" not in _head:
+        _chunk = _raw.recv(4096)
+        if not _chunk:
+            raise ConnectionError("CDP browser handshake: connection closed")
+        _head += _chunk
+    if b" 101 " not in _head.split(b"\r\n", 1)[0]:
+        raise ConnectionError(f"CDP browser handshake rejected: {_head[:80]!r}")
+    _mid = [0]
+
+    def _call(method: str, params: dict | None = None) -> dict:
+        _mid[0] += 1
+        return cdp_send(_raw, {"id": _mid[0], "method": method,
+                               "params": params or {}}, timeout)
+    return _raw, _call
+
+
 def cdp_send(sock: socket.socket, payload: dict, timeout: float,
              call_timeout: float = 0) -> dict:
     """Send one JSON-RPC message as a single masked client text frame; read
@@ -1075,9 +1128,20 @@ def cdp_send(sock: socket.socket, payload: dict, timeout: float,
         hdr += _st.pack("!BQ", 0x80 | 127, n)
     hdr += mask
     sock.sendall(hdr + bytes(b ^ mask[i % 4] for i, b in enumerate(raw)))
+    import socket as _sock_mod
     import struct as _st2
     buf = b""
     sock.settimeout(min(timeout, 5.0))
+    def _recv(n: int) -> bytes:
+        try:
+            chunk = sock.recv(n)
+        except _sock_mod.timeout as e:
+            raise TimeoutError(f"CDP {payload.get('method')} no reply in "
+                               f"{call_timeout or timeout:.0f}s (browser alive, method hung — "
+                               "see --cdp-doctor navigate diagnostics)") from e
+        if not chunk:
+            raise ConnectionError("CDP socket closed mid-frame")
+        return chunk
     while True:
         import time as _t2
         if _t2.monotonic() >= deadline:
@@ -1085,10 +1149,7 @@ def cdp_send(sock: socket.socket, payload: dict, timeout: float,
                                f"{call_timeout or timeout:.0f}s (browser alive, method hung — "
                                "see --cdp-doctor navigate diagnostics)")
         while len(buf) < 2:
-            chunk = sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("CDP socket closed mid-frame")
-            buf += chunk
+            buf += _recv(65536)
         b1, b2 = buf[0], buf[1]
         opcode, ln = b1 & 0x0F, b2 & 0x7F
         off = 2
@@ -1101,10 +1162,7 @@ def cdp_send(sock: socket.socket, payload: dict, timeout: float,
         if b2 & 0x80:
             off += 4  # server->client MUST be unmasked; tolerate if set
         while len(buf) < off + ln:
-            chunk = sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("CDP frame truncated")
-            buf += chunk
+            buf += _recv(65536)
         data = buf[off:off + ln]
         buf = buf[off + ln:]
         if opcode == 0x8:
@@ -1126,16 +1184,21 @@ def cdp_session(sock: socket.socket, target_id: str, timeout: float
     harmless there). Raises with the failing method named."""
     _mid = [0]
 
-    def _raw(method: str, params: dict | None = None) -> dict:
+    def _raw(method: str, params: dict | None = None, call_timeout: float = 0) -> dict:
         _mid[0] += 1
         return cdp_send(sock, {"id": _mid[0], "method": method,
-                               "params": params or {}}, timeout)
+                               "params": params or {}}, timeout, call_timeout)
 
+    # Best-effort with a SHORT deadline: on some builds attach hangs while
+    # sessionless calls work fine. Never let the fix become the hang — fall
+    # back to "" and let the caller proceed without a session prefix.
+    _sid = ""
     try:
-        _r = _raw("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+        _r = _raw("Target.attachToTarget", {"targetId": target_id, "flatten": True},
+                  call_timeout=min(5.0, timeout))
         _sid = _r.get("result", {}).get("sessionId", "")
-    except Exception:
-        _sid = ""
+    except Exception as _e:
+        trace(2, f"cdp attach skipped ({type(_e).__name__}: {str(_e)[:100]}), sessionless mode")
 
     def call(method: str, params: dict | None = None) -> dict:
         _mid[0] += 1
@@ -1336,26 +1399,51 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
     except ConnectionError as e:
         step("HTTP leg (/json/new)", False, str(e)[:160])
         return 1
-    _sid, call = cdp_session(sock, target_id, timeout)
+    # NOTE: Target.* belongs on the BROWSER session, not the page session.
+    # Page-session getTargets hangs silently on strict builds (observed);
+    # browser-session answers everywhere. Fall back page->browser on hang.
+    _r, _n, _how = None, -1, ""
+    call = None
+    _sid = ""
     try:
-        r = call("Target.getTargets")
+        _sid, _pcall = cdp_session(sock, target_id, timeout)
+        call = _pcall
+        _r = _pcall("Target.getTargets")
         try:
-            n = len(r["result"]["targetInfos"])
+            _n = len(_r["result"]["targetInfos"])
         except (KeyError, TypeError):
-            n = -1
-        step("protocol round-trip (Target.getTargets)", True, f"{n} target(s)")
-    except Exception as e:
-        step("protocol round-trip (Target.getTargets)", False,
-             f"{type(e).__name__}: {str(e)[:160]}")
-        say("HINT: handshake + HTTP leg work but protocol hangs — the browser "
-            "may need Target.attachToTarget (now automatic), or a proxy/VPN "
-            "between scanner and browser is eating websocket frames. "
-            "Try --cdp 127.0.0.1:9222 on the SAME host as the browser first.")
-        try:
-            sock.close()
-        except Exception:
             pass
-        return 1
+        _how = "page session"
+    except Exception:
+        _r = None
+    if _r is None or _n == -1:
+        try:
+            _bsock, _bcall = cdp_browser_session(host, port, timeout, token)
+            try:
+                _br = _bcall("Target.getTargets")
+                try:
+                    _n = len(_br["result"]["targetInfos"])
+                except (KeyError, TypeError):
+                    pass
+                _how = "browser session (page session hung — strict build)"
+            finally:
+                try:
+                    _bsock.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            step("protocol round-trip (Target.getTargets)", False,
+                 f"{type(e).__name__}: {str(e)[:160]}")
+            say("HINT: handshake + HTTP leg work but protocol hangs on BOTH page "
+                "and browser sessions — a proxy/VPN between scanner and browser "
+                "is eating websocket frames. Try --cdp 127.0.0.1:9222 on the SAME "
+                "host as the browser first.")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return 1
+    step("protocol round-trip (Target.getTargets)", True, f"{_n} target(s) via {_how}")
     try:
         call("Page.enable")
         call("Page.navigate", {"url": "about:blank"})
