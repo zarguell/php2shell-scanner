@@ -30,6 +30,8 @@ LAB = {  # service -> (port, expected_verdict)
     "fpm-vuln": (19092, "VULNERABLE"),  # nginx->php-fpm 8.5.11, oracle through proxy
     "obscure-vuln": (19093, "NO_PHP_SIGNAL"),  # PHP only at /api/submit; safe probes blind BY DESIGN
     "obscure-fixed": (19094, "NO_PHP_SIGNAL"),  # patched twin: identical silence (control)
+    "appliance-vuln": (19095, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.70 extracted
+    "appliance-fixed": (19096, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.81 extracted
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -300,6 +302,27 @@ class TestLiveLab(unittest.TestCase):
         data = S.run_local_enum()
         self.assertIn("binaries", data)
         self.assertIn("processes", data)
+
+    def test_appliance_twins_attributed_with_build(self):
+        # Locked-down panel UIs, no PHP headers: scanner must attribute the
+        # PHP-backed panel + extract the panel build for advisory lookup.
+        # Vuln twin ships build 18.0.70 (pre-fix era), fixed twin 18.0.81.
+        fv = self._scan(19095)
+        self.assertEqual(fv.verdict, "PHP_NO_VERSION", fv.detail)
+        self.assertTrue(any("plesk" in h for h in fv.app_hits), fv.app_hits)
+        self.assertIn("18.0.70", fv.detail)
+        self.assertIn("44397729587351", fv.detail)  # vendor advisory pointer
+        ff = self._scan(19096)
+        self.assertEqual(ff.verdict, "PHP_NO_VERSION", ff.detail)
+        self.assertIn("18.0.81", ff.detail)
+
+    def test_panel_fingerprints_unit(self):
+        # unit-level: panel bodies attribute without network
+        ver, _, sigs, _ = S.fingerprint_response(
+            {"headers": {"Server": "Apache"},
+             "body": "<title>Plesk Obsidian 18.0.70</title><div class=psa-page>"})
+        self.assertIsNone(ver)
+        self.assertIn("body:app-plesk", sigs)
 
     def test_wordpress_proves_php_app(self):
         f = self._scan(19089)

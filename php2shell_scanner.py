@@ -253,6 +253,19 @@ APP_BODY_RX = [
     ("magento", re.compile(r"magento|/static/version|mage/cookies", re.I)),
     ("prestashop", re.compile(r"prestashop", re.I)),
     ("matomo", re.compile(r"matomo|piwik", re.I)),
+    # Hosting panels (PHP UIs; version = panel build, PHP runtime underneath).
+    ("plesk", re.compile(r"plesk|sw-cp-server|psa-page", re.I)),
+    ("cpanel", re.compile(r"cPanel|WHM|cpanel.*login|/cpsess", re.I)),
+    ("whmcs", re.compile(r"whmcs|WHMCompleteSolution", re.I)),
+    ("passbolt", re.compile(r"passbolt", re.I)),
+    ("coolify", re.compile(r"coolify", re.I)),
+    # Network/security appliances with PHP management UIs.
+    ("panos", re.compile(r"pan-os|panorama|palo\s?alto", re.I)),
+    ("pfsense", re.compile(r"pfSense", re.I)),
+    ("opnsense", re.compile(r"OPNsense", re.I)),
+    ("synology", re.compile(r"synology|diskstation", re.I)),
+    ("qnap", re.compile(r"qnap|QTS", re.I)),
+    ("freenas", re.compile(r"freenas|truenas", re.I)),
 ]
 
 # Safe active probes: each is a normal GET a browser/crawler would issue.
@@ -283,6 +296,25 @@ APP_PROBES = (
     ("/status.php", re.compile(r'"(version|productname)"', re.I), "app-nextcloud:status"),
     ("/mediawiki/load.php", re.compile(r"mediawiki|mw", re.I), "app-mediawiki:load"),
     ("/user/login", re.compile(r"drupal", re.I), "app-drupal:login"),
+    # Hosting panels: login pages + static assets prove the PHP UI. Version
+    # regexes capture the PANEL build (drives vendor-advisory lookup); the
+    # PHP runtime underneath is what php2shell cares about.
+    ("/login.php", re.compile(r"plesk|sw-cp-server", re.I), "app-plesk:login"),
+    ("/cpanel", re.compile(r"cPanel|WHM|login", re.I), "app-cpanel:redirect"),
+    ("/clientarea.php", re.compile(r"whmcs", re.I), "app-whmcs:clientarea"),
+    ("/auth/login", re.compile(r"passbolt", re.I), "app-passbolt:login"),
+    # Appliance management UIs (PHP-backed; locked-down, no version headers).
+    ("/php/login.php", re.compile(r"pan-os|panorama|palo", re.I), "app-panos:login"),
+    ("/api/system/status", re.compile(r"opnsense|qnap|synology", re.I), "app-appliance:status"),
+)
+
+# Panel/appliance VERSION extraction: (signal-prefix, rx with group(1)=version).
+# Panel build -> vendor advisory lookup (Plesk/cPanel ship dated PHP rebuilds).
+PANEL_VERSION_RX = (
+    ("app-plesk", re.compile(r"Plesk\s+(?:Obsidian\s+)?(\d+\.\d+\.\d+)", re.I)),
+    ("app-cpanel", re.compile(r"cPanel\s+(\d+\.\d+\.\d+)", re.I)),
+    ("app-passbolt", re.compile(r"passbolt[^0-9]*(\d+\.\d+\.\d+)", re.I)),
+    ("app-panos", re.compile(r"PAN-OS\s+(\d+\.\d+\.\d+)", re.I)),
 )
 
 
@@ -411,11 +443,13 @@ def run_easter_eggs(opener, url: str, timeout: float) -> tuple[bool, str]:
 
 
 def run_app_probes(opener, url: str, timeout: float,
-                   max_probes: int = 9) -> tuple[list[str], list[str]]:
-    """GET well-known PHP-app endpoints. Returns (hits, tried).
-    A hit needs HTTP 200 AND app-specific content (never status alone)."""
+                   max_probes: int = 25) -> tuple[list[str], list[str], dict]:
+    """GET well-known PHP-app endpoints. Returns (hits, tried, panel_versions).
+    A hit needs HTTP 200 AND app-specific content (never status alone).
+    panel_versions maps signal -> panel build string where extractable."""
     base = url.rstrip("/")
     hits: list[str] = []
+    panel_versions: dict = {}
     tried = 0
     for path, rx, signal in APP_PROBES[:max_probes]:
         tried += 1
@@ -423,9 +457,15 @@ def run_app_probes(opener, url: str, timeout: float,
             res = http_request(opener, base + path, timeout)
         except Exception:
             continue
-        if res.get("status") == 200 and res.get("body") and rx.search(res["body"]):
+        body = res.get("body") or ""
+        if res.get("status") == 200 and body and rx.search(body):
             hits.append(signal)
-    return hits, [p for p, _, _ in APP_PROBES[:max_probes]]
+            for prefix, vrx in PANEL_VERSION_RX:
+                if signal.startswith(prefix):
+                    m = vrx.search(body)
+                    if m:
+                        panel_versions[signal] = m.group(1)
+    return hits, [p for p, _, _ in APP_PROBES[:max_probes]], panel_versions
 
 
 # Deployment droppings: files that exist ONLY beside a PHP deployment.
@@ -553,10 +593,26 @@ def decide(f: Finding) -> Finding:
             why.append(f"easter-egg ({f.egg_evidence})")
         if f.app_hits:
             why.append(f"PHP-only app ({', '.join(f.app_hits[:3])})")
+        pvers = [s.split("=", 1)[1] for s in f.signals if s.startswith("panel-version:")]
+        adv = ""
+        for sig in f.app_hits:
+            if sig.startswith("app-plesk:"):
+                adv = ("panel Plesk — pre-2026-10-21 builds (e.g. 18.0.70) ship unpatched PHP; "
+                       "fixed rebuilds incl. 18.0.81+ (Linux) — verify in Plesk advisory 44397729587351")
+            elif sig.startswith("app-cpanel:"):
+                adv = ("panel cPanel — EA4 pre-25.91 ships unpatched ea-php; fixed EA4 25.91 "
+                       "(ea-php82 8.2.35 / 83 8.3.36 / 84 8.4.27 / 85 8.5.12) + internal 136.0.50")
+            elif sig.startswith("app-panos:"):
+                adv = ("appliance PAN-OS/Panorama — fix pending at advisory time (ETA TBD); "
+                       "treat as exposed until Palo Alto ships: security.paloaltonetworks.com/CVE-2026-109618")
+            if adv:
+                break
         if not why:
             why.append(', '.join(f.signals[:4]) or "weak signals")
         f.detail = ("PHP runtime proven but version undisclosed (" + "; ".join(why) + "); "
-                    "assume vulnerable until patched version proven — "
+                    + (f"panel build {pvers[0]}. " if pvers else "")
+                    + (adv + ". " if adv else "")
+                    + "assume vulnerable until patched version proven — "
                     + ("oracle negative" if f.oracle_ran else "run oracle; blind spot if display_errors=Off"))
         return f
     if f.discovered_paths:
@@ -669,11 +725,13 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
             except Exception as e:
                 f.egg_evidence = f"egg error: {e}"
             try:
-                hits, _ = run_app_probes(opener, url, timeout)
+                hits, _, pvers = run_app_probes(opener, url, timeout)
                 if hits:
                     f.php_detected = True
                     f.app_hits = hits
                     f.signals.extend(hits)
+                    for sig, pv in pvers.items():
+                        f.signals.append(f"panel-version:{sig}={pv}")
             except Exception:
                 pass
             try:

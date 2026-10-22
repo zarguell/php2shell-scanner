@@ -152,11 +152,34 @@ can name. Three things still work, and one authoritative fallback exists:
   For the "I can see php-cgi in ps but the network is silent" case this is
   the authoritative answer remote scanning can never give.
 
+### Layer E — locked-down appliances: panels over PHP version
+
+The attacker's order of operations is panels and appliances first: no
+`--local`, no patch window you control, management UIs facing the network,
+and the vendor advisories in `docs/affected-products.md` (Plesk rebuilds,
+cPanel EA4 25.91, PAN-OS fix-pending) confirm the exposure. The scanner meets
+that with panel-first attribution instead of PHP-version-first:
+
+- **Panel/appliance fingerprints** (13 new body signals, 8 endpoint probes):
+  Plesk, cPanel/WHM, WHMCS, Passbolt, Coolify, PAN-OS/Panorama, pfSense,
+  OPNsense, Synology, QNAP, TrueNAS — login pages, static assets, status
+  endpoints, all 200 + content match.
+- **Panel-build extraction** (`panel-version:*` signals): the panel build
+  string (e.g. Plesk 18.0.70 vs 18.0.81) drives the *vendor* advisory lookup,
+  because for appliances the panel build dates the bundled PHP rebuild. The
+  finding names the advisory (Plesk 44397729587351, cPanel EA4 25.91,
+  PAN-OS ETA-TBD) so triage doesn't stall on "PHP version unknown".
+- **Assume-vulnerable posture.** A PHP-backed panel with undisclosed runtime
+  resolves to `PHP_NO_VERSION` (medium) with "assume vulnerable until patched
+  version proven" — the correct default for an appliance you can't open,
+  where the attacker tries the aggressive probes first and you must get
+  ahead. Lab proof: twin locked-down panel UIs (headers stripped, errors
+  off) both attribute with build strings extracted.
+
 ### Layer D, worked example — the silent-obscure limits demo
 
 The repo ships a deployment where safe probes genuinely go blind, so the
 limitation is demonstrated, not asserted (`tests/lab/docker-compose.yml`:
-`obscure-*`; nginx config `tests/lab/obscure-nginx*.conf`):
 
 - **Shape.** PHP-FPM behind nginx, `display_errors=Off`, `expose_php=Off`,
   no `Server` header, static `/`, PHP reachable ONLY at `/api/submit` (no

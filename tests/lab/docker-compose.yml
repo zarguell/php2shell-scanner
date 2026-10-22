@@ -142,3 +142,30 @@ services:
       - ./obscure-nginx-fixed.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - obscure-fixed-backend
+  # APPLIANCE twins: locked-down "vendor panel" UIs on vuln 8.5.11 vs patched
+  # 8.5.12. No Server header (headers stripped at app layer via header_remove
+  # + .htaccess), errors off, expose_php off — but the panel login pages and
+  # panel build strings leak (as real Plesk/cPanel/PAN-OS UIs do). The scanner
+  # must attribute the PHP-backed panel WITHOUT a PHP version header.
+  appliance-vuln:
+    image: php:8.5.11-apache
+    ports: ["19095:80"]
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && a2enmod headers
+      && printf 'Header unset X-Powered-By\nHeader unset Server\nServerTokens Prod\nServerSignature Off' > /etc/apache2/conf-enabled/zz-headers.conf
+      && rm -f /var/www/html/index.php
+      && printf '<html><head><title>Plesk Obsidian 18.0.70 Login</title></head><body><div class=\"psa-page\"><form action=\"login.php\">Plesk sw-cp-server login</form></div></body></html>' > /var/www/html/index.html
+      && printf '<html><head><title>Plesk Obsidian 18.0.70</title></head><body><div class=\"psa-page\">Plesk sw-cp-server login page</div></body></html>' > /var/www/html/login.php
+      && docker-php-entrypoint apache2-foreground"
+  appliance-fixed:
+    image: php:8.5-apache
+    ports: ["19096:80"]
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && a2enmod headers
+      && printf 'Header unset X-Powered-By\nHeader unset Server\nServerTokens Prod\nServerSignature Off' > /etc/apache2/conf-enabled/zz-headers.conf
+      && rm -f /var/www/html/index.php
+      && printf '<html><head><title>Plesk Obsidian 18.0.81 Login</title></head><body><div class=\"psa-page\"><form action=\"login.php\">Plesk sw-cp-server login</form></div></body></html>' > /var/www/html/index.html
+      && printf '<html><head><title>Plesk Obsidian 18.0.81</title></head><body><div class=\"psa-page\">Plesk sw-cp-server login page</div></body></html>' > /var/www/html/login.php
+      && docker-php-entrypoint apache2-foreground"
