@@ -48,36 +48,42 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 | `--no-oracle` | skip active probe (passive fingerprint only) |
 | `--phpinfo` | also check common phpinfo paths for version disclosure |
 | `--reverse-dns` | PTR lookup per target |
+| `--local` | on-box enumeration: php binaries/versions/SAPIs/processes (run ON the host) |
 | `--insecure` | skip TLS verification (self-signed labs) |
 | `--json` / `-o FILE` | JSON stdout / write JSON report |
 | `--timeout`, `--threads` | per-request seconds (default 8), concurrency (default 16) |
 
 Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
-`PATCHED` · `PHP_NO_VERSION` (PHP seen, version hidden — review manually) ·
+`PATCHED` · `PHP_NO_VERSION` (PHP proven, version hidden) ·
+`PHP_CANNOT_RULE_OUT` (dynamic PHP path, zero identity — run `--local`) ·
 `PHP_UNKNOWN` · `NO_PHP_SIGNAL` · `UNREACHABLE`.
 
 ## Test lab (transparency)
 
-`tests/lab/docker-compose.yml` spins 10 local scenarios; `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-21 — 33/33 green:
+`tests/lab/docker-compose.yml` spins 12 local scenarios; `tests/test_scanner.py`
+asserts every verdict live. Last verified 2026-10-21 — 40/40 green:
 
 | Service | Image | Result |
 |---|---|---|
 | vuln-error-on (`:19081`) | php:8.5.11, errors on | VULNERABLE (oracle 3/3) |
 | eol-old (`:19084`) | php:8.3.6 | VULNERABLE (oracle 3/3) |
 | vague-hardened (`:19088`) | php:8.5.11, headers stripped, static front | VULNERABLE (oracle 3/3 via discovered `/search.php`) |
+| fpm-vuln (`:19092`) | nginx → php-fpm 8.5.11 | VULNERABLE (oracle 3/3 through proxy) |
 | upload-disabled (`:19087`) | php:8.5.11, progress off | LIKELY_VULNERABLE (version; oracle 0/3 — mitigation signal) |
 | patched (`:19083`) | php:8.5.12 | PATCHED (oracle 2/3 — no false positive) |
 | pma (`:19090`) | phpMyAdmin on PHP 8.3.36 | PATCHED (app + version agree) |
 | wordpress-vuln (`:19089`) | WordPress, headers silent | PHP_NO_VERSION (WP assets prove PHP app) |
-| vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (known blind spot, documented) |
+| silent-errors-off (`:19091`) | php:8.5.11, zero disclosure | PHP_CANNOT_RULE_OUT (dynamic path, points at `--local`) |
+| vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (fully silent CGI-like, documented) |
 | notphp (`:19085`) | nginx | NO_PHP_SIGNAL |
 | static-only (`:19086`) | no PHP handler at `/` | NO_PHP_SIGNAL |
 
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (33 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (40 tests)
+# on the box itself (answers "what runs PHP here" authoritatively):
+python3 php2shell_scanner.py --local
 ```
 
 ## Affected-product fleet (pressure test)

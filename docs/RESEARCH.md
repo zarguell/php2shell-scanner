@@ -121,6 +121,37 @@ static, and the oracle needs a PHP-executing path. Three GET-only follow-ups
 
 ### What the scanner deliberately does NOT do
 
+No stalled-multipart triggers, no heap spray, no session-injection canaries,
+no worker-crash observation, no payload execution. Those are exploitation
+primitives (see murrez/dinosn/0x4148 PoCs) — out of scope by design.
+
+### Layer D — the silent box: CGI/FPM with zero disclosure
+
+A fully hardened PHP (errors off, headers stripped, no app paths — typical of
+php-cgi / FPM behind a quiet proxy) leaks nothing the oracle or fingerprint
+can name. Three things still work, and one authoritative fallback exists:
+
+- **404-differential.** `GET /p2s-<rand>.php` vs `.txt` vs extensionless. If
+  `.php` 404s differently (status/length/content-type class), *something*
+  parses `.php` — a handler exists. Verified: FPM-through-nginx differs,
+  plain nginx does not.
+- **Deployment droppings.** `composer.json/.lock`, `.env` (APP_KEY),
+  `server.php`, `artisan` — 200 + content match proves a PHP deployment
+  beside the web root.
+- **Discovered-path surfacing.** Every dynamically-proven PHP path is now
+  recorded on the finding, even when the oracle stays blind.
+- **New verdict `PHP_CANNOT_RULE_OUT`.** Dynamic PHP execution proven, zero
+  identity leaked: the scanner names the paths and says "remotely
+  unconfirmable — run `--local` on the box". This replaces silent
+  `NO_PHP_SIGNAL` for that case; honest uncertainty instead of a false
+  negative.
+- **`--local` on-box enumerator.** Run ON the host: every `php*` binary with
+  `php -v` version + advisory verdict, `php -i` SAPI/ini flags
+  (`expose_php`, `display_errors`, `upload_progress`, `memory_limit`), and
+  the live process table filtered to php/httpd/apache/fpm/cgi workers.
+  For the "I can see php-cgi in ps but the network is silent" case this is
+  the authoritative answer remote scanning can never give.
+
 ## 5. Hardening / mitigation notes (not fixes)
 
 - Real fix: upgrade to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (or vendor backport),

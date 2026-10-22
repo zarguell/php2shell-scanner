@@ -426,6 +426,59 @@ def run_app_probes(opener, url: str, timeout: float,
         if res.get("status") == 200 and res.get("body") and rx.search(res["body"]):
             hits.append(signal)
     return hits, [p for p, _, _ in APP_PROBES[:max_probes]]
+
+
+# Deployment droppings: files that exist ONLY beside a PHP deployment.
+# 200 + content match required (a 404 page with 200 status is not evidence).
+DEPLOY_PROBES = (
+    # (path, must-match-rx, signal)
+    ("/composer.json", re.compile(r'"(require|autoload|name)"\s*:', re.I), "deploy:composer.json"),
+    ("/composer.lock", re.compile(r'"(packages|content-hash)"', re.I), "deploy:composer.lock"),
+    ("/.env", re.compile(r"(APP_KEY|DB_PASSWORD|APP_ENV)=", re.I), "deploy:dotenv"),
+    ("/server.php", re.compile(r"laravel|symfony|public/index", re.I), "deploy:server.php"),
+    ("/artisan", re.compile(r"laravel|artisan", re.I), "deploy:artisan"),
+)
+
+
+def run_deploy_probes(opener, url: str, timeout: float) -> list[str]:
+    """GET deployment-dropping files. Returns hit signals. Safe plain GETs."""
+    base = url.rstrip("/")
+    hits: list[str] = []
+    for path, rx, signal in DEPLOY_PROBES:
+        try:
+            res = http_request(opener, base + path, timeout)
+        except Exception:
+            continue
+        if res.get("status") == 200 and res.get("body") and rx.search(res["body"]):
+            hits.append(signal)
+    return hits
+
+
+def run_404_differential(opener, url: str, timeout: float) -> tuple[bool, str]:
+    """GET /.php vs /.<rand> — if the server treats '*.php' differently from
+    an unknown extension (different status, length class, or content-type),
+    SOMETHING parses .php — a handler exists. Safe plain GETs, no payload."""
+    base = url.rstrip("/")
+    token = "".join(random.choice("abcdef0123456789") for _ in range(12))
+    try:
+        r_php = http_request(opener, base + f"/p2snotfound-{token}.php", timeout)
+        r_txt = http_request(opener, base + f"/p2snotfound-{token}.txt", timeout)
+        r_none = http_request(opener, base + f"/p2snotfound-{token}", timeout)
+    except Exception as e:
+        return False, f"404-differential error: {e}"
+    def sig(r):
+        body = r.get("body") or ""
+        ctype = next((v for k, v in r.get("headers", {}).items()
+                      if k.lower() == "content-type"), "")
+        return (r.get("status"), len(body) // 512, ctype.split(";")[0].strip().lower())
+    s_php, s_txt, s_none = sig(r_php), sig(r_txt), sig(r_none)
+    # control: .txt vs extensionless should usually agree (both static 404s).
+    # signal: .php differs from BOTH -> a .php handler parsed it.
+    if s_php != s_txt and s_php != s_none:
+        # exclude anti-bot pages that differ on every URL (compare txt vs none)
+        return True, (f".php 404 differs (php={s_php} vs txt={s_txt} vs none={s_none}) — "
+                       ".php handler present")
+    return False, f".php 404 identical to static 404 (php={s_php})"
 # ---------------------------------------------------------------- model
 
 @dataclass
@@ -451,6 +504,7 @@ class Finding:
     egg_positive: bool = False
     egg_evidence: str = ""
     app_hits: list[str] = field(default_factory=list)
+    discovered_paths: list[str] = field(default_factory=list)
     signals: list[str] = field(default_factory=list)
     reverse_dns: str | None = None
     verdict: str = "UNREACHABLE"
@@ -504,6 +558,15 @@ def decide(f: Finding) -> Finding:
         f.detail = ("PHP runtime proven but version undisclosed (" + "; ".join(why) + "); "
                     "assume vulnerable until patched version proven — "
                     + ("oracle negative" if f.oracle_ran else "run oracle; blind spot if display_errors=Off"))
+        return f
+    if f.discovered_paths:
+        # PHP executed remotely (dynamic proof) but never identified itself:
+        # errors off + headers stripped. Cannot confirm NOR rule out.
+        f.verdict = "PHP_CANNOT_RULE_OUT"
+        f.confidence = "low"
+        f.detail = ("dynamic PHP-executing path(s) found but PHP never disclosed "
+                    f"({', '.join(f.discovered_paths[:4])}); errors off + headers stripped suspected — "
+                    "run --local on the box or check php -v there; remotely unconfirmable without exploitation")
         return f
     f.verdict = "NO_PHP_SIGNAL"
     f.confidence = "low"
@@ -584,12 +647,18 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
             try:
                 pos, ev = run_oracle(opener, url, timeout)
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
+                # surface which paths proved PHP execution even when silent
+                try:
+                    f.discovered_paths = discover_php_paths(opener, url, timeout)[1:]
+                except Exception:
+                    pass
             except Exception as e:
                 f.oracle_evidence = f"oracle error: {e}"
         # Safe GET-only follow-ups when PHP is unproven or versionless: a
-        # vague hardened box gets ~11 extra plain GETs (eggs + app paths),
-        # no POST, no uploads, no state change. Skip when a version already
-        # classified (nothing to gain) — unless signals exist without version.
+        # vague hardened box gets extra plain GETs (eggs + app/deploy paths +
+        # 404-differential), no POST, no uploads, no state change. Skip when a
+        # version already classified (nothing to gain) — unless signals exist
+        # without version.
         if f.reachable and (not ver or sigs):
             try:
                 epos, eev = run_easter_eggs(opener, url, timeout)
@@ -607,11 +676,24 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                     f.signals.extend(hits)
             except Exception:
                 pass
+            try:
+                dhits = run_deploy_probes(opener, url, timeout)
+                if dhits:
+                    f.php_detected = True
+                    f.signals.extend(dhits)
+            except Exception:
+                pass
+            try:
+                dpos, dev = run_404_differential(opener, url, timeout)
+                f.signals.append(f"404-differential:{dev}")
+                if dpos:
+                    f.php_detected = True
+            except Exception:
+                pass
         out.append(decide(f))
         if scheme == "http" and f.reachable:
             break  # plain-HTTP answered; skip https guess on non-standard ports
     return out
-
 
 def expand_targets(args) -> list[str]:
     hosts: list[str] = []
@@ -665,6 +747,67 @@ def tcp_open(host: str, port: int, timeout: float) -> bool:
         return False
 
 
+def run_local_enum() -> dict:
+    """On-box PHP enumerator: php binaries, versions, SAPIs, ini flags,
+    processes. Read-only (php -v/-i, argv scans). For YOUR case: you see
+    php-cgi/apache processes but the network is silent — this answers
+    'what runs PHP here' authoritatively from inside the box."""
+    import glob as _glob
+    import os as _os
+    import shutil as _sh
+    import subprocess as _sp
+    out: dict = {"binaries": [], "processes": [], "notes": []}
+    seen = set()
+    cands = ["php", "php-cgi", "php-fpm", "php8.5", "php8.4", "php8.3", "php8.2",
+             "php8.1", "php7.4", "php-cgi8.2", "php-fpm8.2"]
+    cands += [p for p in _glob.glob("/usr/local/bin/php*") + _glob.glob("/opt/*/bin/php*")
+              + _glob.glob("/usr/bin/php*") if _os.path.isfile(p) and _os.access(p, _os.X_OK)]
+    for c in cands:
+        path = c if _os.path.isfile(c) else _sh.which(c)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            r = _sp.run([path, "-v"], capture_output=True, text=True, timeout=10)
+            first = (r.stdout or "").splitlines()[0] if r.returncode == 0 else ""
+        except Exception as e:
+            first = f"error: {e}"
+        entry: dict = {"path": path, "php_v": first}
+        m = VER_RE.search(first)
+        if m:
+            ver = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+            verdict, detail = classify_version(ver, first)
+            entry.update({"version": f"{ver[0]}.{ver[1]}.{ver[2]}",
+                          "verdict": ("PATCHED" if verdict == "PATCHED"
+                                      else "LIKELY_VULNERABLE" if verdict in ("LIKELY_VULNERABLE", "EOL_VULNERABLE")
+                                      else verdict), "detail": detail})
+            try:
+                i = _sp.run([path, "-i"], capture_output=True, text=True, timeout=15)
+                ini = i.stdout or ""
+                def flag(k):
+                    mm = re.search(rf"^{k}\s*=>\s*(\S+)", ini, re.M)
+                    return mm.group(1) if mm else "?"
+                entry["sapi"] = flag("Server API")
+                entry["expose_php"] = flag("expose_php")
+                entry["display_errors"] = flag("display_errors")
+                entry["upload_progress"] = flag("session.upload_progress.enabled")
+                entry["memory_limit"] = flag("memory_limit")
+            except Exception:
+                pass
+        out["binaries"].append(entry)
+    # processes: who runs php right now (apache2 + php-cgi/php-fpm workers)?
+    try:
+        r = _sp.run(["ps", "-eo", "comm,args"], capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or "").splitlines():
+            if re.search(r"php|httpd|apache2|fpm|cgi|frankenphp|litespeed", line, re.I):
+                out["processes"].append(line.strip()[:160])
+    except Exception as e:
+        out["notes"].append(f"ps failed: {e}")
+    if not out["binaries"]:
+        out["notes"].append("no php binary found in PATH or common locations")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="php2shell scanner (CVE-2026-109618/109619) — non-destructive detector. "
@@ -677,6 +820,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-oracle", action="store_true", help="skip active oracle probe (version fingerprint only)")
     ap.add_argument("--phpinfo", action="store_true", help="also probe common phpinfo paths for version disclosure")
     ap.add_argument("--reverse-dns", action="store_true", help="PTR lookup for each target IP")
+    ap.add_argument("--local", action="store_true",
+                    help="on-box enumeration: list local php binaries/versions/SAPIs/processes (run ON the host)")
     ap.add_argument("--timeout", type=float, default=8.0)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (labs/self-signed)")
@@ -687,7 +832,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         print(f"php2shell-scanner {TOOL_VERSION}")
         return 0
-
+    if args.local:
+        data = run_local_enum()
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            for b in data["binaries"]:
+                v = b.get("version", "?")
+                say(f"[{b.get('verdict', '?')}] {b['path']} PHP {v} "
+                    f"(sapi={b.get('sapi', '?')}, expose_php={b.get('expose_php', '?')}, "
+                    f"errors={b.get('display_errors', '?')}, progress={b.get('upload_progress', '?')})")
+                if b.get("detail"):
+                    say(f"    {b['detail']}")
+            for p in data["processes"][:20]:
+                say(f"  proc: {p}")
+            for n in data["notes"]:
+                say(f"  note: {n}")
+        n_bad = sum(1 for b in data["binaries"] if b.get("verdict") == "LIKELY_VULNERABLE")
+        return 2 if n_bad else 0
     hosts = expand_targets(args)
     if not hosts:
         ap.error("no target: give TARGET, --targets-file, or --subnet")

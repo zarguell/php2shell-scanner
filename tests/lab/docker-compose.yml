@@ -78,3 +78,31 @@ services:
     ports: ["19090:80"]
     environment:
       PMA_HOST: "none"
+  # SILENT: vuln 8.5.11, errors OFF + headers stripped, dynamic PHP at
+  # /search.php. Oracle blind; version hidden. The CANNOT_RULE_OUT case:
+  # 404-differential + discovered-path evidence must still surface it.
+  silent-errors-off:
+    image: php:8.5.11-apache
+    ports: ["19091:80"]
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1\nServerTokens Prod\nServerSignature Off' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<html><head><title>Portal</title></head><body><h1>Portal</h1></body></html>' > /var/www/html/index.html
+      && rm -f /var/www/html/index.php
+      && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"results for:\" . htmlspecialchars($$q);' > /var/www/html/search.php
+      && docker-php-entrypoint apache2-foreground"
+  # FPM: vuln 8.5.11 via php-fpm + nginx proxy (no PHP headers by default).
+  # CVE-2026-109619's stale-state path is FPM-relevant; scanner must at least
+  # attribute PHP and try the oracle through the proxy.
+  fpm-backend:
+    image: php:8.5.11-fpm
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && printf '<?php echo \"fpm-ok \"; echo phpversion();' > /var/www/html/index.php
+      && php-fpm"
+  fpm-front:
+    image: nginx:alpine
+    ports: ["19092:80"]
+    volumes:
+      - ./fpm-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - fpm-backend

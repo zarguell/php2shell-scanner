@@ -26,6 +26,8 @@ LAB = {  # service -> (port, expected_verdict)
     "vague-hardened": (19088, "VULNERABLE"),  # no headers; oracle via discovered /search.php
     "wordpress-vuln": (19089, "PHP_NO_VERSION"),  # WP assets prove PHP app, version silent
     "pma": (19090, "PATCHED"),  # phpMyAdmin on PHP 8.3.36
+    "silent-errors-off": (19091, "PHP_CANNOT_RULE_OUT"),  # dynamic path, zero disclosure
+    "fpm-vuln": (19092, "VULNERABLE"),  # nginx->php-fpm 8.5.11, oracle through proxy
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -251,6 +253,33 @@ class TestLiveLab(unittest.TestCase):
         self.assertEqual(f.verdict, "VULNERABLE", f.detail)
         self.assertIsNone(f.php_version)
         self.assertIn("/search.php", f.oracle_evidence)
+
+    def test_silent_errors_off_cannot_rule_out(self):
+        # zero disclosure: oracle blind, no version — but dynamic path found.
+        # Must NOT be silent; must name the path and point at --local.
+        f = self._scan(19091)
+        self.assertEqual(f.verdict, "PHP_CANNOT_RULE_OUT", f.detail)
+        self.assertTrue(f.discovered_paths, "discovered PHP paths must surface")
+        self.assertIn("/search.php", f.discovered_paths)
+        self.assertIn("--local", f.detail)
+
+    def test_fpm_vulnerable_through_proxy(self):
+        f = self._scan(19092)
+        self.assertEqual(f.verdict, "VULNERABLE", f.detail)
+        self.assertTrue(f.oracle_positive, f.oracle_evidence)
+        self.assertIn("8.5.11", f.php_version or "")
+
+    def test_404_differential(self):
+        # FPM proxy parses .php differently from static 404s; nginx alone doesn't
+        pos_fpm, _ = S.run_404_differential(self.opener, "http://127.0.0.1:19092/", 10)
+        self.assertTrue(pos_fpm)
+        pos_nginx, _ = S.run_404_differential(self.opener, "http://127.0.0.1:19085/", 10)
+        self.assertFalse(pos_nginx)
+
+    def test_local_enumerator(self):
+        data = S.run_local_enum()
+        self.assertIn("binaries", data)
+        self.assertIn("processes", data)
 
     def test_wordpress_proves_php_app(self):
         f = self._scan(19089)
