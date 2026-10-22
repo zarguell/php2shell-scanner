@@ -88,8 +88,10 @@ python3 php2shell_scanner.py --local
 python3 php2shell_scanner.py -p 19097 127.0.0.1 -v
 # limits demo (lab only — megabyte probes, expect worker impact):
 python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
-# contained RCE demo (lab twins only, marker-write, cleanup enforced — authorized testing):
+# contained RCE demo (marker-write, cleanup enforced — authorized testing):
 # docker compose -f tests/lab/docker-compose.rce.yml up -d && python3 tests/lab/rce_demo.py
+# retarget to YOUR authorized box (double confirmation: typed echo + P2S_RCE_ARM=1):
+# P2S_RCE_ARM=1 python3 tests/lab/rce_demo.py --target 10.0.0.5:8080 --lfi-path /vuln.php --session-path /tmp
 ```
 
 ## Affected-product fleet (pressure test)

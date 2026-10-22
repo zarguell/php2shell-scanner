@@ -587,6 +587,27 @@ RCEDEMO = os.environ.get("P2S_RCEDEMO") == "1" or "--rcedemo" in sys.argv
 
 @unittest.skipUnless(RCEDEMO, "contained RCE demo, opt-in only (P2S_RCEDEMO=1 or --rcedemo)")
 class TestRceDemo(unittest.TestCase):
+    def test_retarget_refusals(self):
+        import subprocess as _sp
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # no arm -> refuse, exit nonzero-equivalent message, rc 1
+        r = _sp.run([sys.executable, "tests/lab/rce_demo.py", "--target", "10.0.0.5:8080"],
+                    capture_output=True, text=True, timeout=60, cwd=root, stdin=_sp.DEVNULL)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("P2S_RCE_ARM", r.stdout)
+        # arm + non-tty stdin -> refuse (no script-driven retargeting)
+        import os as _os
+        env = dict(_os.environ, P2S_RCE_ARM="1")
+        r2 = _sp.run([sys.executable, "tests/lab/rce_demo.py", "--target", "10.0.0.5:8080"],
+                     capture_output=True, text=True, timeout=60, cwd=root, stdin=_sp.DEVNULL, env=env)
+        self.assertEqual(r2.returncode, 1, r2.stdout)
+        self.assertIn("not a TTY", r2.stdout)
+        # lab default still works with no flags
+        r3 = _sp.run([sys.executable, "tests/lab/rce_demo.py", "--help"],
+                     capture_output=True, text=True, timeout=30, cwd=root)
+        self.assertIn("--target", r3.stdout)
+
+
     """AUTHORIZED LAB ONLY. Runs tests/lab/rce_demo.py (Chain-A marker write)
     against the rce twins and asserts the documented outcome: BOTH twins
     RCE-positive (the fix does not remove app-layer session injection or the
