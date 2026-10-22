@@ -176,6 +176,38 @@ that with panel-first attribution instead of PHP-version-first:
   ahead. Lab proof: twin locked-down panel UIs (headers stripped, errors
   off) both attribute with build strings extracted.
 
+### Layer F — behavioral proofs: fan-out without per-app hardcodes
+
+Hand-listed login pages don't scale: every new appliance means another row.
+Three mechanisms ask questions ANY PHP stack answers by construction,
+regardless of vendor — plus a harvester that learns the site's own surface:
+
+- **Method differential** (OPTIONS + PROPFIND vs GET). Lab matrix:
+  Apache+mod_php and FPM-proxy answer 200 to exotic methods (the handler
+  executes for any method); static nginx answers 405. PROPFIND-200 (or
+  OPTIONS-200 with `Allow: POST`) separates dynamic handlers from file
+  servers. Corroboration — a Java app server also 200s — never standalone
+  PHP proof. Live: fires on mod_php/FPM/silent-Apache/appliance, silent on
+  nginx. (Tomcat-class servers are the known confounder; the PHP-token gate
+  on version parsing still blocks the false-positive path.)
+- **Cookie grooming v2** (session rotation, cookieless opener). First visit
+  mints, second fresh visit mints a DIFFERENT id → server-side session
+  minter (Roundcube-class apps rotate per visit). Static servers never
+  Set-Cookie. The scanner uses a dedicated cookieless opener — the shared
+  jar was swallowing the second mint (caught live). Silent on session-less
+  endpoints (most hardened fronts): corroboration, never proof.
+- **Self-naming harvester.** Every fetched page is scanned for
+  href/src/action `*.php` links; discovered targets feed the dynamic
+  query-reflection test, then the oracle. The scanner probes the SITE'S OWN
+  php surface instead of guessing ours — N unseen apps fan out through
+  their own links. Live: appliance twin's own `/login.php` harvested;
+  vague box's `/search.php` validated dynamic. (Static `.php` files that
+  don't execute — like the lab's Plesk facade — correctly stay oracle-silent;
+  harvest feeds *candidates*, the dynamic test decides.)
+- **Behavioral corroboration count.** Cookie/egg/404 signals each add one;
+  2+ on an otherwise silent box is recorded for the operator. Deliberately
+  NOT a verdict escalator: generic dynamic-handler evidence is not PHP
+  evidence, and the obscure-pair test pins that NO_PHP_SIGNAL stands.
 ### Layer D, worked example — the silent-obscure limits demo
 
 The repo ships a deployment where safe probes genuinely go blind, so the

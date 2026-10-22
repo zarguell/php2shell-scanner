@@ -109,6 +109,31 @@ class TestVersions(unittest.TestCase):
         self.assertTrue(S.DISTRO_RE.search("8.5.11-1+deb12u1"))
 
 
+class TestBehavioral(unittest.TestCase):
+    """Generic proofs: no per-app knowledge. Harvester + grooming + method
+    matrix are pure functions of response behavior, tested offline."""
+    def test_harvest_php_links(self):
+        bodies = ['<a href="/admin/login.php">x</a> <form action="search.php?q=1">',
+                  "<script src='/js/app.js'></script>"]
+        # dead base: fetch fails, extra_bodies still parsed
+        got = S.harvest_php_links(S.make_opener(1, False),
+                                  "http://127.0.0.1:1/", 1,
+                                  extra_bodies=bodies)
+        self.assertIn("/admin/login.php", got)
+        self.assertIn("/search.php", got)
+        self.assertNotIn("/js/app.js", got)
+
+    def test_link_rx_ignores_non_php(self):
+        self.assertIsNone(S.LINK_RX.search('<a href="/about">x</a>'))
+        self.assertIsNotNone(S.LINK_RX.search('<a href="/a.php">x</a>'))
+
+    def test_grooming_needs_bare_opener(self):
+        # contract: grooming builds its own cookieless opener internally
+        import inspect
+        src = inspect.getsource(S.run_cookie_grooming)
+        self.assertIn("make_bare_opener", src)
+
+
 class TestFingerprint(unittest.TestCase):
     """Pressure battery: every fingerprint the server may leak."""
     def fp(self, headers=None, body=""):

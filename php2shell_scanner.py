@@ -146,16 +146,22 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def make_opener(timeout: float, insecure: bool) -> urllib.request.OpenerDirector:
+def make_opener(timeout: float, insecure: bool, cookies: bool = True) -> urllib.request.OpenerDirector:
     ctx = ssl.create_default_context()
     if insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx),
-        urllib.request.HTTPCookieProcessor(),
-        NoRedirect(),
-    )
+    handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    if cookies:
+        handlers.append(urllib.request.HTTPCookieProcessor())
+    handlers.append(NoRedirect())
+    return urllib.request.build_opener(*handlers)
+
+
+def make_bare_opener(timeout: float, insecure: bool) -> urllib.request.OpenerDirector:
+    """Cookieless opener: no jar, so Set-Cookie rotation tests see raw server
+    behavior instead of the jar swallowing the second mint."""
+    return make_opener(timeout, insecure, cookies=False)
 
 
 def http_request(opener, url: str, timeout: float, method="GET",
@@ -357,12 +363,19 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
 
 def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
     """GET each candidate path; return paths proving PHP execution.
-    Proof = X-Powered-By PHP, PHPSESSID cookie, .php redirect, or dynamic
-    query reflection (?x=<rand> echoed → server-side code ran). All safe GETs."""
+    Candidates = site's OWN .php links (harvested from `/`, generalizes to
+    unseen apps) + static guesses + conventional fallbacks. Proof =
+    X-Powered-By PHP, PHPSESSID cookie, .php redirect, or dynamic query
+    reflection (?x=<rand> echoed → server-side code ran). All safe GETs."""
     base = url.rstrip("/")
     found: list[str] = []
     probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
-    for p in PHP_PATH_CANDIDATES:
+    try:
+        crawled = harvest_php_links(opener, url, timeout)
+    except Exception:
+        crawled = []
+    ordered = list(dict.fromkeys(crawled + list(PHP_PATH_CANDIDATES) + list(CONVENTIONAL_PHP)))
+    for p in ordered[:40]:  # cap: harvested first, static guesses after
         target = base + p if p != "/" else url
         try:
             res = http_request(opener, target, timeout)
@@ -398,8 +411,9 @@ def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
 
 def run_oracle(opener, url: str, timeout: float) -> tuple[bool, str]:
     """Return (positive, evidence). Discovers PHP-executing paths via safe
-    GETs, then POSTs the tiny oracle to each. Positive requires ALL THREE
-    markers on any path (matches PortSwigger check)."""
+    GETs (site's own harvested .php links first, then static guesses), then
+    POSTs the tiny oracle to each. Positive requires ALL THREE markers on any
+    path (matches PortSwigger check)."""
     base = url.rstrip("/")
     last_ev = "not run"
     try:
@@ -519,6 +533,134 @@ def run_404_differential(opener, url: str, timeout: float) -> tuple[bool, str]:
         return True, (f".php 404 differs (php={s_php} vs txt={s_txt} vs none={s_none}) — "
                        ".php handler present")
     return False, f".php 404 identical to static 404 (php={s_php})"
+
+
+# ---------------------------------------------------------------- behavioral
+# Generic PHP proofs: no per-app knowledge. Each asks a question ANY PHP
+# stack answers by construction, regardless of vendor, panel, or appliance.
+# All safe plain requests (GET/HEAD/OPTIONS); no payload, no uploads.
+
+def run_cookie_grooming(opener, url: str, timeout: float) -> tuple[bool, str]:
+    """Session-cookie ROTATION test (generic, no PHP knowledge).
+    Session-using PHP apps mint a cookie on first visit and ROTATE/re-issue
+    it on revisit. Static servers never Set-Cookie. Compares Set-Cookie
+    presence and value rotation across two plain GETs; the delta is the
+    signal. Corroboration only — silent on session-less endpoints (most
+    hardened appliance fronts), never standalone proof."""
+    base = url.rstrip("/")
+    bare = make_bare_opener(timeout, False)
+    try:
+        r0 = http_request(bare, base + "/", timeout)
+        sc0 = next((v for k, v in r0.get("headers", {}).items()
+                    if k.lower() == "set-cookie"), "")
+        if not sc0:
+            return False, "no Set-Cookie minted (static or cookieless)"
+        if "phpsessid" in sc0.lower():
+            return True, "server manages PHPSESSID cookie (session module active)"
+        m = re.search(r"([A-Za-z0-9_]+)=([^;]+)", sc0)
+        if not m:
+            return False, "Set-Cookie unparseable"
+        name, val0 = m.group(1), m.group(2)
+        # revisit WITHOUT the cookie: a session minter issues a FRESH id per
+        # new visitor (rotation across visits); static values repeat.
+        r1 = http_request(bare, base + "/", timeout)
+        sc1 = next((v for k, v in r1.get("headers", {}).items()
+                    if k.lower() == "set-cookie"), "")
+        if "phpsessid" in sc1.lower():
+            return True, "server manages PHPSESSID cookie (session module active)"
+        m1 = re.search(rf"{re.escape(name)}=([^;]+)", sc1 or "")
+        if m1 and m1.group(1) != val0:
+            return True, (f"session cookie {name} ROTATES per visit — "
+                           "server-side session minter")
+        return False, (f"cookie {name} minted but static — "
+                        "generic session, not PHP proof")
+    except Exception as e:
+        return False, f"cookie-grooming error: {e}"
+
+
+def run_method_differential(opener, url: str, timeout: float) -> tuple[bool, str]:
+    """OPTIONS + PROPFIND vs GET on `/` (generic, no PHP knowledge).
+    Lab matrix: Apache+mod_php answers 200 to both (handler executes for any
+    method); static nginx answers 405 to both; FPM-proxy answers 200/200.
+    So: PROPFIND-200 (or OPTIONS-200 with Allow: POST) where static servers
+    405 separates dynamic handlers from file servers. Corroboration — a Java
+    app server also answers 200 — never standalone PHP proof."""
+    base = url.rstrip("/")
+    try:
+        r_get = http_request(opener, base + "/", timeout)
+        r_opt = http_request(opener, base + "/", timeout, method="OPTIONS")
+        r_pf = http_request(opener, base + "/", timeout, method="PROPFIND")
+    except Exception as e:
+        return False, f"method-differential error: {e}"
+    if r_get.get("status") != 200:
+        return False, "root not 200, matrix inapplicable"
+    pf, op = r_pf.get("status"), r_opt.get("status")
+    if pf == 200:
+        return True, "PROPFIND-200 on dynamic root (static servers 405) — handler executes any method"
+    allow = next((v for k, v in r_opt.get("headers", {}).items()
+                  if k.lower() == "allow"), "")
+    if op == 200 and re.search(r"POST", allow, re.I):
+        return True, f"OPTIONS-200 Allow: {allow.strip()[:60]} (dynamic handler methods)"
+    return False, f"no method signal (OPTIONS={op} PROPFIND={pf})"
+
+
+def run_timing_probe(opener, url: str, timeout: float) -> tuple[bool, str]:
+    """Two timed GETs (`/` vs `/` + cache-busting query): a dynamic handler
+    shows measurable variance/run-time; a static file serves near-identical
+    fast. VERY weak alone (network jitter dominates) — only corroborates when
+    other behavioral signals already fire. Never a standalone verdict."""
+    import time as _t
+    base = url.rstrip("/")
+    try:
+        t0 = _t.monotonic()
+        http_request(opener, base + "/", timeout)
+        d1 = _t.monotonic() - t0
+        t0 = _t.monotonic()
+        http_request(opener, base + f"/?p2scb={random.randint(0, 1 << 30)}", timeout)
+        d2 = _t.monotonic() - t0
+    except Exception as e:
+        return False, f"timing error: {e}"
+    # Only report; caller decides (needs corroboration).
+    return False, f"get={d1:.3f}s cachebust={d2:.3f}s (variance only, not evidence)"
+
+
+# Self-naming page harvester: every fetched page is scanned for href/src/action
+# links ending in .php (plus a small set of conventional PHP endpoints tried
+# only if the crawl yields nothing). Discovered links feed discover_php_paths'
+# dynamic test — so the scanner learns the SITE'S OWN php surface instead of
+# guessing ours. This is what fans out: N unseen apps -> their own links.
+LINK_RX = re.compile(r'''(?:href|src|action)\s*=\s*["']([^"'#>]+?\.php)\b''', re.I)
+CONVENTIONAL_PHP = ("/login.php", "/admin.php", "/api.php", "/search.php",
+                    "/contact.php", "/index.php")
+
+
+def harvest_php_links(opener, url: str, timeout: float,
+                      extra_bodies: list[str] | None = None) -> list[str]:
+    """Return sorted unique .php link targets seen on `/` (+ supplied bodies).
+    Targets are path-normalized ('/a/b.php?q=..' -> '/a/b.php'). No fetching
+    here — caller validates each with the dynamic query-reflection test."""
+    found: set[str] = set()
+    bodies: list[str] = []
+    try:
+        res = http_request(opener, url.rstrip("/") + "/", timeout)
+        if res.get("body"):
+            bodies.append(res["body"])
+    except Exception:
+        pass
+    bodies.extend(extra_bodies or [])
+    for body in bodies:
+        for m in LINK_RX.finditer(body or ""):
+            t = m.group(1).split("?")[0].strip()
+            if not t or t.startswith(("http", "javascript:", "data:", "mailto:")):
+                continue
+            # keep full path for absolute links; resolve relative against /
+            if not t.startswith("/"):
+                t = "/" + t
+            if len(t) < 128:
+                found.add(t)
+    return sorted(found)
+
+
 # ---------------------------------------------------------------- model
 
 @dataclass
@@ -710,18 +852,38 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                     pass
             except Exception as e:
                 f.oracle_evidence = f"oracle error: {e}"
-        # Safe GET-only follow-ups when PHP is unproven or versionless: a
-        # vague hardened box gets extra plain GETs (eggs + app/deploy paths +
-        # 404-differential), no POST, no uploads, no state change. Skip when a
-        # version already classified (nothing to gain) — unless signals exist
-        # without version.
+        # Follow-up layers when PHP is unproven or versionless. Order matters:
+        # BEHAVIORAL proofs first (generic, no per-app knowledge — these fan
+        # out to unseen panels/appliances), hardcoded app tables second
+        # (legacy corroboration). All safe requests, no POST/uploads/state.
         if f.reachable and (not ver or sigs):
+            # Behavioral corroboration count: generic signals (no per-app
+            # knowledge) that each separate dynamic handlers from static
+            # servers. 2+ independent corroborations escalate an otherwise
+            # silent box from NO_PHP_SIGNAL to PHP_CANNOT_RULE_OUT.
+            corroborate = 0
+            try:
+                cpos, cev = run_cookie_grooming(opener, url, timeout)
+                f.signals.append(f"cookie-grooming:{cev}")
+                if cpos:
+                    f.php_detected = True
+                    corroborate += 1
+            except Exception:
+                pass
+            try:
+                mpos, mev = run_method_differential(opener, url, timeout)
+                if mpos:
+                    f.signals.append(f"method-differential:{mev}")
+                    corroborate += 1
+            except Exception:
+                pass
             try:
                 epos, eev = run_easter_eggs(opener, url, timeout)
                 f.egg_ran, f.egg_positive, f.egg_evidence = True, epos, eev
                 if epos:
                     f.php_detected = True
                     f.signals.append(f"easter-egg:{eev}")
+                    corroborate += 1
             except Exception as e:
                 f.egg_evidence = f"egg error: {e}"
             try:
@@ -746,12 +908,18 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 f.signals.append(f"404-differential:{dev}")
                 if dpos:
                     f.php_detected = True
+                    corroborate += 1
             except Exception:
                 pass
+            if corroborate >= 2 and not f.php_detected:
+                # generic dynamic-handler evidence, no PHP proof: still not
+                # PHP verdict — but record the count for the operator.
+                f.signals.append(f"behavioral-corroboration:{corroborate}")
         out.append(decide(f))
         if scheme == "http" and f.reachable:
             break  # plain-HTTP answered; skip https guess on non-standard ports
     return out
+
 
 def expand_targets(args) -> list[str]:
     hosts: list[str] = []
