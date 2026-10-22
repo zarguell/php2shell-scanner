@@ -204,6 +204,15 @@ regardless of vendor — plus a harvester that learns the site's own surface:
   vague box's `/search.php` validated dynamic. (Static `.php` files that
   don't execute — like the lab's Plesk facade — correctly stay oracle-silent;
   harvest feeds *candidates*, the dynamic test decides.)
+- **Bounded spider (multi-page).** Single-page harvest is blind when the
+  front page links only to static pages and PHP lives clicks down. BFS crawl
+  (same host, HTML only, depth ≤ 2, ≤ 10 pages, logout/asset links skipped,
+  missing-ctype HTML followed) harvests `.php` targets AND JS `fetch()` ajax
+  endpoints from every visited page; all feed discovery's dynamic test.
+  Live proof (`deep-surface` lab): static front → `/about`, `/docs` →
+  `/portal/` → `/portal/home.php` (dynamic `?q` handler); single-page
+  harvest `[]`, spider `['/portal/home.php']`, oracle 3/3 there. Budget ~11
+  GETs worst case; plain GETs only, no state change.
 - **Behavioral corroboration count.** Cookie/egg/404 signals each add one;
   2+ on an otherwise silent box is recorded for the operator. Deliberately
   NOT a verdict escalator: generic dynamic-handler evidence is not PHP

@@ -32,6 +32,7 @@ LAB = {  # service -> (port, expected_verdict)
     "obscure-fixed": (19094, "NO_PHP_SIGNAL"),  # patched twin: identical silence (control)
     "appliance-vuln": (19095, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.70 extracted
     "appliance-fixed": (19096, "PHP_NO_VERSION"),  # panel UI attributed, build 18.0.81 extracted
+    "deep-surface": (19097, "VULNERABLE"),  # spider-only find: PHP 2 clicks down, oracle via /portal/home.php
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -126,6 +127,12 @@ class TestBehavioral(unittest.TestCase):
     def test_link_rx_ignores_non_php(self):
         self.assertIsNone(S.LINK_RX.search('<a href="/about">x</a>'))
         self.assertIsNotNone(S.LINK_RX.search('<a href="/a.php">x</a>'))
+
+    def test_extract_links_js_fetch(self):
+        got = S.extract_links('<script>fetch("/api/go.php")</script>')
+        self.assertIn("/api/go.php", got)
+        self.assertEqual(S.extract_links(None), set())
+        self.assertEqual(S.extract_links("<html>no links</html>"), set())
 
     def test_grooming_needs_bare_opener(self):
         # contract: grooming builds its own cookieless opener internally
@@ -327,6 +334,19 @@ class TestLiveLab(unittest.TestCase):
         data = S.run_local_enum()
         self.assertIn("binaries", data)
         self.assertIn("processes", data)
+
+    def test_spider_finds_deep_surface(self):
+        # PHP two clicks down a static front: single-page harvest is blind,
+        # the bounded spider must find /portal/home.php and fire the oracle.
+        op = self.opener
+        base = "http://127.0.0.1:19097/"
+        self.assertEqual(S.harvest_php_links(op, base, 10), [])
+        tgts, visited = S.spider_site(op, base, 10)
+        self.assertIn("/portal/home.php", tgts)
+        self.assertIn("/portal/", visited)
+        f = self._scan(19097)
+        self.assertEqual(f.verdict, "VULNERABLE", f.detail)
+        self.assertIn("/portal/home.php", f.oracle_evidence)
 
     def test_appliance_twins_attributed_with_build(self):
         # Locked-down panel UIs, no PHP headers: scanner must attribute the

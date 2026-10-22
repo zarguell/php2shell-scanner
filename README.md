@@ -60,8 +60,8 @@ Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 
 ## Test lab (transparency)
 
-`tests/lab/docker-compose.yml` spins 16 local scenarios; `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 43/43 green:
+`tests/lab/docker-compose.yml` spins 17 local scenarios; `tests/test_scanner.py`
+asserts every verdict live. Last verified 2026-10-22 — 48/48 green:
 
 | Service | Image | Result |
 |---|---|---|
@@ -75,6 +75,7 @@ asserts every verdict live. Last verified 2026-10-22 — 43/43 green:
 | wordpress-vuln (`:19089`) | WordPress, headers silent | PHP_NO_VERSION (WP assets prove PHP app) |
 | appliance-vuln (`:19095`) | locked-down panel UI, no PHP headers | PHP_NO_VERSION (Plesk panel + build 18.0.70 → vendor advisory) |
 | appliance-fixed (`:19096`) | locked-down panel UI, no PHP headers | PHP_NO_VERSION (Plesk panel + build 18.0.81 → vendor advisory) |
+| deep-surface (`:19097`) | static front, PHP 2 clicks down | VULNERABLE (spider → `/portal/home.php` → oracle 3/3) |
 | silent-errors-off (`:19091`) | php:8.5.11, zero disclosure | PHP_CANNOT_RULE_OUT (dynamic path, points at `--local`) |
 | obscure-vuln (`:19093`) / obscure-fixed (`:19094`) | FPM pair, PHP only at `/api/submit` | both NO_PHP_SIGNAL — the documented limits demo (safe probes blind by design) |
 | vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (fully silent CGI-like, documented) |
@@ -84,7 +85,7 @@ asserts every verdict live. Last verified 2026-10-22 — 43/43 green:
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (43 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (48 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # limits demo (lab only — megabyte probes, expect worker impact):

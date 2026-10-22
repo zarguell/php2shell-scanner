@@ -363,19 +363,22 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
 
 def discover_php_paths(opener, url: str, timeout: float) -> list[str]:
     """GET each candidate path; return paths proving PHP execution.
-    Candidates = site's OWN .php links (harvested from `/`, generalizes to
-    unseen apps) + static guesses + conventional fallbacks. Proof =
-    X-Powered-By PHP, PHPSESSID cookie, .php redirect, or dynamic query
-    reflection (?x=<rand> echoed → server-side code ran). All safe GETs."""
+    Candidates = bounded spider crawl (site's own links, 1-2 clicks down) +
+    static guesses + conventional fallbacks. Proof = X-Powered-By PHP,
+    PHPSESSID cookie, .php redirect, or dynamic query reflection. All safe GETs."""
     base = url.rstrip("/")
     found: list[str] = []
     probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
     try:
+        spider_targets, _ = spider_site(opener, url, min(timeout, 6.0))
+    except Exception:
+        spider_targets = set()
+    try:
         crawled = harvest_php_links(opener, url, timeout)
     except Exception:
         crawled = []
-    ordered = list(dict.fromkeys(crawled + list(PHP_PATH_CANDIDATES) + list(CONVENTIONAL_PHP)))
-    for p in ordered[:40]:  # cap: harvested first, static guesses after
+    ordered = list(dict.fromkeys(sorted(spider_targets) + crawled + list(PHP_PATH_CANDIDATES) + list(CONVENTIONAL_PHP)))
+    for p in ordered[:40]:  # cap: spider first, static guesses after
         target = base + p if p != "/" else url
         try:
             res = http_request(opener, target, timeout)
@@ -624,21 +627,39 @@ def run_timing_probe(opener, url: str, timeout: float) -> tuple[bool, str]:
     return False, f"get={d1:.3f}s cachebust={d2:.3f}s (variance only, not evidence)"
 
 
-# Self-naming page harvester: every fetched page is scanned for href/src/action
-# links ending in .php (plus a small set of conventional PHP endpoints tried
-# only if the crawl yields nothing). Discovered links feed discover_php_paths'
-# dynamic test — so the scanner learns the SITE'S OWN php surface instead of
-# guessing ours. This is what fans out: N unseen apps -> their own links.
+# Self-naming page harvester + bounded spider: every fetched page is scanned
+# for href/src/action links ending in .php (plus JS fetch()/ajax string
+# literals). Discovered links feed discover_php_paths' dynamic test — so the
+# scanner learns the SITE'S OWN php surface instead of guessing ours. This is
+# what fans out: N unseen apps -> their own links, one and two clicks down.
 LINK_RX = re.compile(r'''(?:href|src|action)\s*=\s*["']([^"'#>]+?\.php)\b''', re.I)
+JS_PHP_RX = re.compile(r'''["']((?:/[A-Za-z0-9_.\-/]*)?[A-Za-z0-9_.\-/]+\.php)\b''')
 CONVENTIONAL_PHP = ("/login.php", "/admin.php", "/api.php", "/search.php",
                     "/contact.php", "/index.php")
+
+
+def extract_links(body: str | None) -> set[str]:
+    found: set[str] = set()
+    if not body:
+        return found
+    for rx in (LINK_RX, JS_PHP_RX):
+        for m in rx.finditer(body):
+            t = m.group(1).split("?")[0].strip()
+            if not t or t.startswith(("http", "javascript:", "data:", "mailto:", "//")):
+                continue
+            if not t.startswith("/"):
+                t = "/" + t
+            if len(t) < 128:
+                found.add(t)
+    return found
 
 
 def harvest_php_links(opener, url: str, timeout: float,
                       extra_bodies: list[str] | None = None) -> list[str]:
     """Return sorted unique .php link targets seen on `/` (+ supplied bodies).
     Targets are path-normalized ('/a/b.php?q=..' -> '/a/b.php'). No fetching
-    here — caller validates each with the dynamic query-reflection test."""
+    here — caller validates each with the dynamic query-reflection test.
+    Single-page only; use spider_site() for multi-page crawl."""
     found: set[str] = set()
     bodies: list[str] = []
     try:
@@ -649,16 +670,74 @@ def harvest_php_links(opener, url: str, timeout: float,
         pass
     bodies.extend(extra_bodies or [])
     for body in bodies:
-        for m in LINK_RX.finditer(body or ""):
-            t = m.group(1).split("?")[0].strip()
-            if not t or t.startswith(("http", "javascript:", "data:", "mailto:")):
-                continue
-            # keep full path for absolute links; resolve relative against /
-            if not t.startswith("/"):
-                t = "/" + t
-            if len(t) < 128:
-                found.add(t)
+        for t in extract_links(body):
+            found.add(t)
     return sorted(found)
+
+
+def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
+                max_depth: int = 2) -> tuple[set[str], set[str]]:
+    """Bounded BFS crawl for PHP surface. Returns (php_targets, visited).
+    Seeds at `/`; follows same-origin HTML links (any href, not just .php)
+    to `max_depth`; every visited page contributes extract_links() hits.
+    Budget: 1 + pages visited (cap max_pages), all plain GETs, same host,
+    non-HTML content-types not followed, logout/logoff links skipped.
+    This is what finds PHP two clicks down a static front."""
+    from urllib.parse import urljoin, urlparse
+    base = url.rstrip("/")
+    host = urlparse(base).hostname or ""
+    php_targets: set[str] = set()
+    visited: set[str] = set()
+    queue: list[tuple[str, int]] = [("/", 0)]
+    HREF_RX = re.compile(r'''href\s*=\s*["']([^"'#>]+)["']''', re.I)
+    pages = 0
+    while queue and pages < max_pages:
+        path, depth = queue.pop(0)
+        if path in visited:
+            continue
+        visited.add(path)
+        try:
+            res = http_request(opener, base + path if path != "/" else url, timeout)
+        except Exception:
+            continue
+        pages += 1
+        body = res.get("body") or ""
+        ctype = next((v for k, v in res.get("headers", {}).items()
+                      if k.lower() == "content-type"), "").lower()
+        for t in extract_links(body):
+            php_targets.add(t)
+        # missing content-type on a non-empty text body: treat as followable
+        # (extensionless static files often serve without ctype; the dynamic
+        # test later decides per-path — following is harmless, all plain GETs)
+        looks_html = ("html" in ctype or (not ctype and body.strip().startswith("<")))
+        if depth >= max_depth or not looks_html:
+            continue
+        for m in HREF_RX.finditer(body):
+            href = m.group(1).split("?")[0].split("#")[0].strip()
+            if not href or href.startswith(("http", "//", "javascript:", "data:",
+                                            "mailto:", "#")):
+                # same-origin absolute URLs: keep path if host matches
+                if href.startswith("http"):
+                    try:
+                        u = urlparse(href)
+                        if u.hostname != host:
+                            continue
+                        href = u.path or "/"
+                    except Exception:
+                        continue
+                else:
+                    continue
+            low = href.lower()
+            if any(k in low for k in ("logout", "logoff", "signout", ".css", ".js",
+                                      ".png", ".jpg", ".ico", ".svg", ".woff")):
+                continue
+            if not href.startswith("/"):
+                href = "/" + href
+            # extensionless directory links (/portal/) serve index content —
+            # keep the trailing slash so the fetch hits the same resource
+            if len(href) < 128 and href not in visited:
+                queue.append((href, depth + 1))
+    return php_targets, visited
 
 
 # ---------------------------------------------------------------- model

@@ -169,3 +169,21 @@ services:
       && printf '<html><head><title>Plesk Obsidian 18.0.81 Login</title></head><body><div class=\"psa-page\"><form action=\"login.php\">Plesk sw-cp-server login</form></div></body></html>' > /var/www/html/index.html
       && printf '<html><head><title>Plesk Obsidian 18.0.81</title></head><body><div class=\"psa-page\">Plesk sw-cp-server login page</div></body></html>' > /var/www/html/login.php
       && docker-php-entrypoint apache2-foreground"
+  # DEEP-SURFACE (spider demo): vuln 8.5.11, errors ON, headers stripped. The
+  # front page is static and links only to static pages; the PHP lives TWO
+  # CLICKS down (/docs -> /portal/home.php, dynamic ?q handler). Single-page
+  # harvest sees nothing; the bounded spider must find /portal/home.php and
+  # the oracle must fire there. None of the static guess paths hit.
+  deep-surface:
+    image: php:8.5.11-apache
+    ports: ["19097:80"]
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && rm -f /var/www/html/index.php
+      && printf '<html><head><title>Acme Corp</title></head><body><nav><a href=\"/about\">About</a><a href=\"/docs\">Docs</a></nav><h1>Welcome</h1></body></html>' > /var/www/html/index.html
+      && printf '<html><head><title>About</title></head><body><h1>About Acme</h1></body></html>' > /var/www/html/about
+      && printf '<html><head><title>Docs</title></head><body><h1>Docs</h1><a href=\"/portal/\">Customer portal</a></body></html>' > /var/www/html/docs
+      && mkdir -p /var/www/html/portal
+      && printf '<html><head><title>Portal</title></head><body><h1>Portal</h1><a href=\"/portal/home.php\">Enter</a></body></html>' > /var/www/html/portal/index.html
+      && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"portal-home:\" . htmlspecialchars($$q);' > /var/www/html/portal/home.php
+      && docker-php-entrypoint apache2-foreground"
