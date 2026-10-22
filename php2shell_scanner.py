@@ -1016,6 +1016,7 @@ class Finding:
     app_hits: list[str] = field(default_factory=list)
     discovered_paths: list[str] = field(default_factory=list)
     lfi_sinks: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
     prove_ran: bool = False
     prove_positive: bool = False
     prove_evidence: str = ""
@@ -1024,6 +1025,15 @@ class Finding:
     verdict: str = "UNREACHABLE"
     confidence: str = "none"
     detail: str = ""
+
+def mark(f, text: str) -> None:
+    """Record a POSITIVE proving signal: visible in detail + JSON evidence.
+    Negative probe outcomes stay in f.signals only (debugging), never in
+    f.evidence (verdict justification)."""
+    f.php_detected = True
+    f.evidence.append(text)
+    f.signals.append(text)
+
 
 def decide(f: Finding) -> Finding:
     if not f.reachable:
@@ -1072,11 +1082,14 @@ def decide(f: Finding) -> Finding:
         proven = f.egg_positive or bool(f.app_hits)
         f.verdict = "PHP_NO_VERSION"
         f.confidence = "medium" if proven else "low"
-        why = []
-        if f.egg_positive:
-            why.append(f"easter-egg ({f.egg_evidence})")
-        if f.app_hits:
-            why.append(f"PHP-only app ({', '.join(f.app_hits[:3])})")
+        # why cites POSITIVE evidence only (f.evidence): every entry is a probe
+        # that FIRED. Negative probe outcomes live in f.signals with a (-)
+        # marker for debugging and are NEVER cited as proof. If evidence is
+        # ever empty here it is a bug — say so instead of citing negatives.
+        why = list(f.evidence[:4])
+        if not why:
+            why = ["PROVENANCE BUG: php_detected with empty evidence — report this"]
+            f.confidence = "low"
         pvers = [s.split("=", 1)[1] for s in f.signals if s.startswith("panel-version:")]
         adv = ""
         for sig in f.app_hits:
@@ -1185,7 +1198,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         trace(1, f"fingerprint {url}: HTTP {res.get('status')} "
                   f"version={ver or '-'} src={src or '-'} signals={len(sigs)}")
         if ver:
-            f.php_detected = True
+            mark(f, f"version:{ver} ({src})")
             f.php_version = ver
             f.version_source = src
             f.version_branch_only = branch_only
@@ -1206,14 +1219,15 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
             else:
                 f.version_verdict, f.version_detail = classify_version(parse_strict_version(ver), ver)
         elif sigs:
-            f.php_detected = True
+            for sg in sigs:
+                mark(f, sg)
         if phpinfo and not ver:
             for p in COMMON_PHPINFO_PATHS:
                 r2 = http_request(opener, url.rstrip("/") + p, timeout)
                 if r2.get("status") == 200 and r2.get("body"):
                     m = PHPINFO_VER_RE.search(r2["body"])
                     if m:
-                        f.php_detected = True
+                        mark(f, f"phpinfo:{p}={m.group(1)}.{m.group(2)}.{m.group(3)}")
                         f.php_version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
                         f.version_source = f"phpinfo:{p}"
                         f.version_verdict, f.version_detail = classify_version(
@@ -1262,10 +1276,11 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
             corroborate = 0
             try:
                 cpos, cev = run_cookie_grooming(opener, url, timeout)
-                f.signals.append(f"cookie-grooming:{cev}")
                 if cpos:
-                    f.php_detected = True
+                    mark(f, f"cookie-grooming:{cev}")
                     corroborate += 1
+                else:
+                    f.signals.append(f"cookie-grooming(-):{cev}")
             except Exception:
                 pass
             try:
@@ -1279,34 +1294,36 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 epos, eev = run_easter_eggs(opener, url, timeout)
                 f.egg_ran, f.egg_positive, f.egg_evidence = True, epos, eev
                 if epos:
-                    f.php_detected = True
-                    f.signals.append(f"easter-egg:{eev}")
+                    mark(f, f"easter-egg:{eev}")
                     corroborate += 1
+                else:
+                    f.signals.append(f"easter-egg(-):{eev}")
             except Exception as e:
                 f.egg_evidence = f"egg error: {e}"
             try:
                 hits, _, pvers = run_app_probes(opener, url, timeout)
                 if hits:
-                    f.php_detected = True
                     f.app_hits = hits
-                    f.signals.extend(hits)
+                    for h in hits:
+                        mark(f, h)
                     for sig, pv in pvers.items():
-                        f.signals.append(f"panel-version:{sig}={pv}")
+                        mark(f, f"panel-version:{sig}={pv}")
             except Exception:
                 pass
             try:
                 dhits = run_deploy_probes(opener, url, timeout)
                 if dhits:
-                    f.php_detected = True
-                    f.signals.extend(dhits)
+                    for h in dhits:
+                        mark(f, h)
             except Exception:
                 pass
             try:
                 dpos, dev = run_404_differential(opener, url, timeout)
-                f.signals.append(f"404-differential:{dev}")
                 if dpos:
-                    f.php_detected = True
+                    mark(f, f"404-differential:{dev}")
                     corroborate += 1
+                else:
+                    f.signals.append(f"404-differential(-):{dev}")
             except Exception:
                 pass
             if corroborate >= 2 and not f.php_detected:

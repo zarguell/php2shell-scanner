@@ -207,6 +207,35 @@ class TestRecap(unittest.TestCase):
         self.assertIn("none required", out)
 
 
+class TestEvidence(unittest.TestCase):
+    """Provenance: detail cites positives only; negatives labeled (-)."""
+    def test_detail_never_cites_negatives(self):
+        f = S.Finding(target="h:80", host="h", port=80, scheme="http",
+                      url="http://h/", reachable=True, http_status=200)
+        S.mark(f, "body:app-plesk")
+        f.signals.append("cookie-grooming(-):no Set-Cookie minted")
+        f.signals.append("404-differential(-):identical")
+        out = S.decide(f)
+        self.assertEqual(out.verdict, "PHP_NO_VERSION")
+        self.assertIn("body:app-plesk", out.detail)
+        self.assertNotIn("cookie-grooming", out.detail)
+        self.assertNotIn("404-differential", out.detail)
+
+    def test_empty_evidence_is_flagged(self):
+        f = S.Finding(target="h:80", host="h", port=80, scheme="http",
+                      url="http://h/", reachable=True, http_status=200)
+        f.php_detected = True  # simulate a setter that forgot mark()
+        out = S.decide(f)
+        self.assertIn("PROVENANCE BUG", out.detail)
+
+    def test_mark_sets_detected(self):
+        f = S.Finding(target="h:80", host="h", port=80, scheme="http",
+                      url="http://h/", reachable=True, http_status=200)
+        S.mark(f, "deploy:composer.json")
+        self.assertTrue(f.php_detected)
+        self.assertIn("deploy:composer.json", f.evidence)
+
+
 class TestTimeouts(unittest.TestCase):
     """Timeout rules: pre-check, budgets, progress routing."""
     def test_precheck_closed_port_fast(self):
