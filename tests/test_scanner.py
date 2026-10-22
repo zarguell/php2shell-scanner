@@ -135,6 +135,20 @@ class TestBehavioral(unittest.TestCase):
         self.assertEqual(S.extract_links(None), set())
         self.assertEqual(S.extract_links("<html>no links</html>"), set())
 
+    def test_relative_js_resolves_against_page(self):
+        # regression: src="js/x.js" on https://h/ must fetch https://h/js/x.js,
+        # NEVER https://hjs/x.js (missing slash). urljoin against page URL.
+        from urllib.parse import urljoin
+        page_url = "https://192.168.1.1/"
+        self.assertEqual(urljoin(page_url, "js/query.mind.js"),
+                         "https://192.168.1.1/js/query.mind.js")
+        self.assertEqual(urljoin("https://192.168.1.1/docs/", "js/query.mind.js"),
+                         "https://192.168.1.1/docs/js/query.mind.js")
+        self.assertEqual(urljoin(page_url, "/static/app.js"),
+                         "https://192.168.1.1/static/app.js")
+        import inspect
+        self.assertIn("urljoin(page_url", inspect.getsource(S.spider_site))
+
     def test_grooming_needs_bare_opener(self):
         # contract: grooming builds its own cookieless opener internally
         import inspect

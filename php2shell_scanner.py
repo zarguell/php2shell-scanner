@@ -789,8 +789,12 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                         continue
                 if not src or len(src) >= 128 or src in visited:
                     continue
+                # resolve against the PAGE's URL (handles relative src="js/x.js",
+                # root-absolute /static/y.js, and same-origin absolute URLs)
+                page_url = base + path if path != "/" else url
+                full = urljoin(page_url if page_url.endswith("/") else page_url + "/", src)
                 try:
-                    jr = http_request(opener, base + src, timeout)
+                    jr = http_request(opener, full, timeout)
                     visited.add(src)
                     js_fetched += 1
                 except Exception:
@@ -801,7 +805,7 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                     if t not in php_targets:
                         new_targets.add(t)
                         php_targets.add(t)
-                trace(1, f"spider-js {base}{src} ({len(jbody)}B) "
+                trace(1, f"spider-js {full} ({len(jbody)}B) "
                           f"+{len(new_targets)}php total={len(php_targets)}")
         for m in HREF_RX.finditer(body):
             href = m.group(1).split("?")[0].split("#")[0].strip()
