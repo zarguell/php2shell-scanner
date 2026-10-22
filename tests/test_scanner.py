@@ -615,9 +615,19 @@ class TestProveRce(unittest.TestCase):
     Runs against the RCE twins only (19110/19111); no confirmation needed
     below the CLI layer (direct function calls, same as the CLI path after
     double confirmation)."""
+    def _rce_up(self):
+        import urllib.request
+        try:
+            urllib.request.urlopen("http://127.0.0.1:19110/", timeout=5).read(16)
+            return True
+        except Exception:
+            return False
+
     def test_lfi_sink_autodiscovered(self):
         if not LIVE:
             self.skipTest("needs live rce twins")
+        if not self._rce_up():
+            self.skipTest("rce twins down (docker-compose.rce.yml)")
         op = S.make_opener(10, False)
         sinks = S.discover_lfi_sinks(op, "http://127.0.0.1:19110/", 10)
         self.assertIn(("/vuln.php", "page"), sinks)
@@ -625,6 +635,8 @@ class TestProveRce(unittest.TestCase):
     def test_prove_reports_honest_tier(self):
         if not LIVE:
             self.skipTest("needs live rce twins")
+        if not self._rce_up():
+            self.skipTest("rce twins down (docker-compose.rce.yml)")
         op = S.make_opener(10, False)
         # suffix-less session include: read primitive proven, RCE unproven
         # through echo — the scanner must say exactly that, never RCE-PROVEN.
