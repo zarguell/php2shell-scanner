@@ -299,12 +299,18 @@ def fingerprint_response(res: dict) -> tuple[str | None, str | None, list[str], 
     body = res.get("body", "")
     if body:
         if "PHPSESSID" in body:
-            signals.append("body:PHPSESSID")
-        if re.search(r'\.php["\'\s>]', body):
-            signals.append("body:.php-link")
+            i = body.find("PHPSESSID")
+            snippet = re.sub(r"\s+", " ", body[max(0, i-40):i+50]).strip()[:100]
+            signals.append(f"body:PHPSESSID | '{snippet}'")
+        ml = re.search(r'\.php["\'\s>]', body)
+        if ml:
+            snippet = re.sub(r"\s+", " ", body[max(0, ml.start()-40):ml.end()+40]).strip()[:100]
+            signals.append(f"body:.php-link | '{snippet}'")
         for app, rx in APP_BODY_RX:
-            if rx.search(body):
-                signals.append(f"body:app-{app}")
+            m = rx.search(body)
+            if m:
+                snippet = re.sub(r"\s+", " ", body[max(0, m.start()-40):m.end()+40]).strip()[:100]
+                signals.append(f"body:app-{app} | '{snippet}'")
         m = PHPINFO_VER_RE.search(body)
         if m and version is None:
             version = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
@@ -682,8 +688,10 @@ def run_app_probes(opener, url: str, timeout: float,
         except Exception:
             continue
         body = res.get("body") or ""
-        if res.get("status") == 200 and body and rx.search(body):
-            hits.append(signal)
+        m = rx.search(body) if body else None
+        if res.get("status") == 200 and body and m:
+            snippet = re.sub(r"\s+", " ", body[max(0, m.start()-40):m.end()+40]).strip()[:100]
+            hits.append(f"{signal} @{path} | '{snippet}'")
             for prefix, vrx in PANEL_VERSION_RX:
                 if signal.startswith(prefix):
                     m = vrx.search(body)
@@ -713,8 +721,11 @@ def run_deploy_probes(opener, url: str, timeout: float) -> list[str]:
             res = http_request(opener, base + path, timeout)
         except Exception:
             continue
-        if res.get("status") == 200 and res.get("body") and rx.search(res["body"]):
-            hits.append(signal)
+        body = res.get("body") or ""
+        m = rx.search(body) if body else None
+        if res.get("status") == 200 and body and m:
+            snippet = re.sub(r"\s+", " ", body[max(0, m.start()-40):m.end()+40]).strip()[:100]
+            hits.append(f"{signal} @{path} | '{snippet}'")
     return hits
 
 

@@ -99,6 +99,15 @@ python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 
 ## Reading a finding (evidence vs signals)
 
+Every evidence entry now carries its match: `body:app-cpanel |
+'<form action=...cPanel login...>'` (what matched), `app-plesk:login
+@/login.php | '<title>Plesk…'` (which endpoint + what it returned). The
+`-v` spider lines show where each target was found. So "we think it's PHP"
+always comes with the quoted text that fired — your sanity check is the
+snippet, not the signal name.
+
+
+
 `detail` cites POSITIVE evidence only — probes that fired
 (`body:app-plesk`, `app-plesk:login`, `panel-version:…=18.0.70`). Failed probes
 are labeled `(-)` (`cookie-grooming(-):…`, `404-differential(-):…`) and stay in

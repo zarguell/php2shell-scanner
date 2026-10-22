@@ -248,6 +248,14 @@ class TestEvidence(unittest.TestCase):
         seg = src.split("run_method_differential")[1].split("run_easter_eggs")[0]
         self.assertNotIn("mark(f", seg)
 
+    def test_snippets_attached(self):
+        # sanity check: signal carries matched text + endpoint
+        _, _, sigs, _ = S.fingerprint_response(
+            {"headers": {}, "body": '<form action="login.php">cPanel login</form>'})
+        app = [x for x in sigs if x.startswith("body:app-cpanel")]
+        self.assertTrue(app, sigs)
+        self.assertIn("cPanel login", app[0])
+
     def test_mark_sets_detected(self):
         f = S.Finding(target="h:80", host="h", port=80, scheme="http",
                       url="http://h/", reachable=True, http_status=200)
@@ -370,11 +378,11 @@ class TestFingerprint(unittest.TestCase):
 
     def test_framework_signals(self):
         _, _, sigs, _ = self.fp({"Server": "nginx"}, '<a href="i.php">x</a>')
-        self.assertIn("body:.php-link", sigs)
+        self.assertTrue(any(x.startswith("body:.php-link") for x in sigs), sigs)
         _, _, sigs, _ = self.fp(body='<script src="/wp-includes/x.js">')
-        self.assertIn("body:app-wordpress", sigs)
+        self.assertTrue(any(x.startswith("body:app-wordpress") for x in sigs), sigs)
         _, _, sigs, _ = self.fp(body='<input name="_token" data-csrf-token>')
-        self.assertIn("body:app-laravel", sigs)
+        self.assertTrue(any(x.startswith("body:app-laravel") for x in sigs), sigs)
 
 
 class TestOracleBody(unittest.TestCase):
@@ -615,7 +623,7 @@ class TestLiveLab(unittest.TestCase):
             {"headers": {"Server": "Apache"},
              "body": "<title>Plesk Obsidian 18.0.70</title><div class=psa-page>"})
         self.assertIsNone(ver)
-        self.assertIn("body:app-plesk", sigs)
+        self.assertTrue(any(x.startswith("body:app-plesk") for x in sigs), sigs)
 
     def test_wordpress_proves_php_app(self):
         f = self._scan(19089)
