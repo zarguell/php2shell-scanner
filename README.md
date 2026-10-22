@@ -82,7 +82,7 @@ asserts every verdict live. Last verified 2026-10-22 — 74/74 green (live; Test
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (71 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (74 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # trace what the spider saw (stderr; -vv adds every request):
