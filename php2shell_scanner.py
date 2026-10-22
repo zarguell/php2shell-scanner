@@ -1104,8 +1104,6 @@ def decide(f: Finding) -> Finding:
                        "treat as exposed until Palo Alto ships: security.paloaltonetworks.com/CVE-2026-109618")
             if adv:
                 break
-        if not why:
-            why.append(', '.join(f.signals[:4]) or "weak signals")
         f.detail = ("PHP runtime proven but version undisclosed (" + "; ".join(why) + "); "
                     + (f"panel build {pvers[0]}. " if pvers else "")
                     + (adv + ". " if adv else "")
@@ -1257,7 +1255,8 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                                            spider_pages, spider_depth)
                 if sinks:
                     f.lfi_sinks = [f"{p}?{pn}=" for p, pn in sinks[:5]]
-                    f.signals.extend(f"lfi-sink:{p}?{pn}=" for p, pn in sinks[:5])
+                    for pth, pn in sinks[:5]:
+                        mark(f, f"lfi-sink:{pth}?{pn}=")
                     if prove_rce:
                         f.prove_ran = True
                         ok, ev = prove_chain_a(opener, url, timeout, sinks[0])

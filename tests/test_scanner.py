@@ -228,6 +228,26 @@ class TestEvidence(unittest.TestCase):
         out = S.decide(f)
         self.assertIn("PROVENANCE BUG", out.detail)
 
+    def test_audit_no_detail_cites_signals_slice(self):
+        import inspect
+        src = inspect.getsource(S.decide)
+        self.assertNotIn("signals[:", src)
+
+    def test_audit_lfi_sink_is_evidence(self):
+        f = S.Finding(target="h:80", host="h", port=80, scheme="http",
+                      url="http://h/", reachable=True, http_status=200)
+        S.mark(f, "lfi-sink:/vuln.php?page=")
+        out = S.decide(f)
+        self.assertEqual(out.verdict, "PHP_NO_VERSION")
+        self.assertIn("lfi-sink:/vuln.php?page=", out.detail)
+
+    def test_audit_method_diff_never_proves(self):
+        import inspect
+        src = inspect.getsource(S.scan_endpoint)
+        # method-differential must never call mark() (corroboration only)
+        seg = src.split("run_method_differential")[1].split("run_easter_eggs")[0]
+        self.assertNotIn("mark(f", seg)
+
     def test_mark_sets_detected(self):
         f = S.Finding(target="h:80", host="h", port=80, scheme="http",
                       url="http://h/", reachable=True, http_status=200)
