@@ -745,6 +745,31 @@ class TestAffectedFleet(unittest.TestCase):
 
 
 RCEDEMO = os.environ.get("P2S_RCEDEMO") == "1" or "--rcedemo" in sys.argv
+CDP = os.environ.get("P2S_CDP") or ("--cdp-test" in sys.argv and "127.0.0.1:9222") or ""
+
+
+@unittest.skipUnless(CDP, "needs YOUR Chromium on CDP (P2S_CDP=host:port or --cdp-test for 127.0.0.1:9222)")
+class TestCdpBridge(unittest.TestCase):
+    """Bring-your-own-browser: stdlib CDP, no Playwright. Skipped unless a
+    CDP endpoint is provided — CI without a browser stays green."""
+    def test_rendered_page(self):
+        op = S.make_opener(10, False)
+        try:
+            html, urls = S.cdp_rendered_page(CDP, "http://127.0.0.1:19101/", 20)
+        except Exception as e:
+            self.skipTest(f"CDP unreachable: {e}")
+        self.assertIn("<html", html.lower())
+        self.assertTrue(any("loader.js" in u for u in urls), urls)
+
+    def test_spider_uses_resources(self):
+        op = S.make_opener(10, False)
+        try:
+            tgts, _, arts = S.spider_site(op, "http://127.0.0.1:19101/", 15, cdp=CDP)
+        except Exception as e:
+            self.skipTest(f"CDP unreachable: {e}")
+        flat = " ".join(arts)
+        self.assertIn("StringTable", flat, arts)
+
 
 
 class TestProveRce(unittest.TestCase):
@@ -846,6 +871,9 @@ if __name__ == "__main__":
     if "--fleet" in sys.argv:
         sys.argv.remove("--fleet")
         os.environ["P2S_FLEET"] = "1"
+    if "--cdp-test" in sys.argv:
+        sys.argv.remove("--cdp-test")
+        os.environ["P2S_CDP"] = "127.0.0.1:9222"
     if "--rcedemo" in sys.argv:
         sys.argv.remove("--rcedemo")
         os.environ["P2S_RCEDEMO"] = "1"

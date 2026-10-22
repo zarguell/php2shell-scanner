@@ -263,6 +263,20 @@ include, auto_prepend_file, LFI wrapper) — demonstrated with docker-exec
 ground truth in `tests/lab/rce_demo.py`. The scanner never upgrades a read
 primitive into an RCE verdict.
 
+### Layer G2 — optional CDP browser (bring your own Chromium)
+
+No Playwright, no bundled download, no new dependency. You launch any
+Chromium/Chrome (`--headless=new --remote-debugging-port=9222`), pass
+`--cdp 127.0.0.1:9222`, and the scanner speaks CDP over a hand-rolled stdlib
+websocket (`Page.navigate` + `Runtime.evaluate`): rendered
+`documentElement.outerHTML` plus `performance` resource URLs per crawled page.
+That catches what static parsing cannot — e.g. the js-dyn StringTable, which
+the browser loads (`StringTable_en.js` in resources) even though no static
+or dynamic ref names the final URL. Downstream (extract, artifacts, oracle)
+is unchanged: the browser is a richer body supplier. Disabled by default;
+per-page CDP failure falls back to plain HTTP. Verified live against a real
+Chromium (Comet 155): `TestCdpBridge` (skipped without `P2S_CDP`/`--cdp-test`).
+
 ### Layer G — scheme negotiation: both protocols, upgrades, TLS honesty
 
 The old logic (HTTP-only on :80, HTTPS-only on :443, stop after HTTP answers)

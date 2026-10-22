@@ -47,6 +47,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 | `-p PORTS` / `--discover-ports` | explicit ports (`80,8080,9000-9010`) or probe common web ports |
 | `--reverse-dns` | PTR lookup per target |
 | `--local` | on-box enumeration: php binaries/versions/SAPIs/processes (run ON the host) |
+| `--cdp host:port` | YOUR Chromium via CDP (you launch `--remote-debugging-port=9222`); rendered DOM + loaded resources feed spider. Default off; stdlib only, no Playwright |
 | `--spider-pages N` (default 10) / `--spider-depth D` (default 2) | site-crawl budget per endpoint. `0/0` = single-page harvest only (quietest); aggressive: `--spider-pages 50 --spider-depth 4` |
 | `--prove-rce` | AUTHORIZED ONLY: auto-discover LFI sink (inert) + contained Chain-A marker-write with cleanup. Double confirmation: `P2S_RCE_ARM=1` + typed target echo on TTY. Honest tiers: `RCE-PROVEN` or read-primitive-only |
 | `-v` / `-vv` | trace to stderr: `-v` per-phase lines (fingerprint/spider/discover/oracle/verdict), `-vv` adds every request (method+path+status+ms) |

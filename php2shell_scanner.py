@@ -468,7 +468,8 @@ def looks_like_php_response(res: dict, body_hint: str = "") -> bool:
 
 
 def discover_php_paths(opener, url: str, timeout: float,
-                       spider_pages: int = 10, spider_depth: int = 2
+                       spider_pages: int = 10, spider_depth: int = 2,
+                       cdp: str = ""
                        ) -> tuple[list[str], list[str]]:
     """GET each candidate path; return paths proving PHP execution.
     Candidates = bounded spider crawl (site's own links, spider_depth clicks
@@ -480,7 +481,8 @@ def discover_php_paths(opener, url: str, timeout: float,
     probe_token = "p2s" + "".join(random.choice("abcdef0123456789") for _ in range(8))
     try:
         spider_targets, _, _dyn_art = spider_site(opener, url, min(timeout, 6.0),
-                                                  max_pages=spider_pages, max_depth=spider_depth)
+                                                  max_pages=spider_pages, max_depth=spider_depth,
+                                                  cdp=cdp)
     except Exception:
         spider_targets, _dyn_art = set(), []
     try:
@@ -642,7 +644,7 @@ def discover_lfi_sinks(opener, url: str, timeout: float,
 
 
 def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
-               spider_depth: int = 2) -> tuple[bool, str]:
+               spider_depth: int = 2, cdp: str = "") -> tuple[bool, str]:
     """Return (positive, evidence). Discovers PHP-executing paths via safe
     GETs (site's own harvested .php links first, then static guesses), then
     POSTs the tiny oracle to each. Positive requires ALL THREE markers on any
@@ -650,7 +652,7 @@ def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
     base = url.rstrip("/")
     last_ev = "not run"
     try:
-        paths, _ = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
+        paths, _ = discover_php_paths(opener, url, timeout, spider_pages, spider_depth, cdp)
     except Exception:
         paths = list(ORACLE_PATHS)
     for p in paths:
@@ -911,9 +913,200 @@ def harvest_php_links(opener, url: str, timeout: float,
             found.add(t)
     return sorted(found)
 
+# ---------------------------------------------------------------- CDP bridge
+# Optional rendered-DOM harvesting through YOUR OWN Chromium (bring-your-own
+# browser; no Playwright, no bundled download, no new dependency).
+#   1. Launch it yourself: chromium --headless=new --no-sandbox
+#      --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
+#      (any Chromium/Chrome executable and version works).
+#   2. Pass --cdp 127.0.0.1:9222 to the scanner.
+# The bridge speaks CDP over a hand-rolled RFC 6455 websocket (stdlib only:
+# http.client + socket + hashlib + base64 + struct) and returns, per page:
+# rendered documentElement.outerHTML (post-JS DOM) + performance resource URLs
+# (every bundle/XHR the page actually loaded — including runtime-joined
+# StringTables no static or dynamic ref names). Downstream (extract_links,
+# artifact parse, discovery, oracle) is unchanged: the browser is a richer
+# body supplier, nothing more. Disabled by default; --cdp "" never connects.
+
+
+def cdp_ws_connect(host: str, port: int, timeout: float
+                   ) -> tuple[socket.socket, str]:
+    """Open a CDP target session: GET /json/new -> webSocketDebuggerUrl ->
+    RFC 6455 client handshake. Returns (connected socket, target id)."""
+    import base64 as _b64
+    import hashlib as _hl
+    import http.client as _hc
+    import struct as _st
+    conn = _hc.HTTPConnection(host, port, timeout=timeout)
+    resp = None
+    last_status = None
+    for _verb in ("PUT", "GET"):
+        try:
+            conn.request(_verb, "/json/new?about:blank")
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            last_status = resp.status
+            if resp.status in (200, 201):
+                break
+        except Exception:
+            last_status = None
+            continue
+    if resp is None or last_status not in (200, 201):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise ConnectionError(f"CDP /json/new -> HTTP {last_status}")
+    import json as _js
+    data = _js.loads(resp_body.decode("utf-8", "replace"))
+    target_id = data.get("id", "")
+    try:
+        conn.close()
+    except Exception:
+        pass
+    ws_url = data.get("webSocketDebuggerUrl", "")
+    if not ws_url:
+        raise ConnectionError("CDP /json/new returned no webSocketDebuggerUrl")
+    from urllib.parse import urlparse as _up
+    u = _up(ws_url)
+    wpath = u.path + (("?" + u.query) if u.query else "")
+    raw = socket.create_connection((host, u.port or port), timeout=timeout)
+    raw.settimeout(timeout)
+    key = _b64.b64encode(bytes(__import__("os").urandom(16))).decode()
+    raw.sendall(f"GET {wpath} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = raw.recv(4096)
+        if not chunk:
+            raise ConnectionError("CDP handshake: connection closed")
+        head += chunk
+    if b" 101 " not in head.split(b"\r\n", 1)[0]:
+        raise ConnectionError(f"CDP handshake rejected: {head[:80]!r}")
+    return raw, target_id
+
+
+def cdp_send(sock: socket.socket, payload: dict, timeout: float) -> dict:
+    """Send one JSON-RPC message as a single masked client text frame; read
+    frames until the matching id arrives (events interleaved are skipped)."""
+    import json as _js
+    import os as _os
+    import struct as _st
+    raw = _js.dumps(payload).encode()
+    mask = _os.urandom(4)
+    hdr = bytes([0x81])
+    n = len(raw)
+    if n < 126:
+        hdr += _st.pack("!B", 0x80 | n)
+    elif n < 65536:
+        hdr += _st.pack("!BH", 0x80 | 126, n)
+    else:
+        hdr += _st.pack("!BQ", 0x80 | 127, n)
+    hdr += mask
+    sock.sendall(hdr + bytes(b ^ mask[i % 4] for i, b in enumerate(raw)))
+    import struct as _st2
+    buf = b""
+    sock.settimeout(timeout)
+    while True:
+        while len(buf) < 2:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("CDP socket closed mid-frame")
+            buf += chunk
+        b1, b2 = buf[0], buf[1]
+        opcode, ln = b1 & 0x0F, b2 & 0x7F
+        off = 2
+        if ln == 126:
+            ln = _st2.unpack("!H", buf[2:4])[0]
+            off = 4
+        elif ln == 127:
+            ln = _st2.unpack("!Q", buf[2:10])[0]
+            off = 10
+        if b2 & 0x80:
+            off += 4  # server->client MUST be unmasked; tolerate if set
+        while len(buf) < off + ln:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("CDP frame truncated")
+            buf += chunk
+        data = buf[off:off + ln]
+        buf = buf[off + ln:]
+        if opcode == 0x8:
+            raise ConnectionError("CDP socket closed by browser")
+        if opcode != 0x1:
+            continue  # binary/ping/pong: ignore
+        try:
+            msg = _js.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == payload.get("id"):
+            return msg
+
+
+def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
+                      wait_ms: int = 1500) -> tuple[str, list[str]]:
+    """Navigate a CDP target to page_url, wait for load + wait_ms, return
+    (rendered_outerHTML, resource_urls). Raises on any failure (caller treats
+    as 'browser unavailable for this page', falls back to plain HTTP)."""
+    import json as _js
+    host, _, port_s = cdp.partition(":")
+    port = int(port_s) if port_s else 9222
+    sock, target_id = cdp_ws_connect(host.strip() or "127.0.0.1", port, timeout)
+    try:
+        mid = [0]
+
+        def call(method: str, params: dict | None = None) -> dict:
+            mid[0] += 1
+            return cdp_send(sock, {"id": mid[0], "method": method,
+                                   "params": params or {}}, timeout)
+        call("Page.enable")
+        call("Runtime.enable")
+        call("Page.navigate", {"url": page_url})
+        import time as _t
+        deadline = _t.monotonic() + min(timeout, 15.0)
+        while _t.monotonic() < deadline:
+            r = call("Runtime.evaluate", {"expression": "document.readyState",
+                                          "returnByValue": True})
+            try:
+                if r["result"]["result"]["value"] in ("complete", "interactive"):
+                    break
+            except (KeyError, TypeError):
+                pass
+            _t.sleep(0.25)
+        _t.sleep(min(wait_ms / 1000.0, 5.0))
+        dom = call("Runtime.evaluate", {
+            "expression": "document.documentElement ? document.documentElement.outerHTML : ''",
+            "returnByValue": True})
+        try:
+            html = dom["result"]["result"]["value"] or ""
+        except (KeyError, TypeError):
+            html = ""
+        res = call("Runtime.evaluate", {
+            "expression": ("(function(){try{return performance.getEntriesByType('resource')"
+                           ".map(function(e){return e.name})"
+                           ".filter(function(u){return /\\.(js|php)(\\?|$)/i.test(u)})"
+                           ".slice(0,50)}catch(e){return []}})()"),
+            "returnByValue": True})
+        try:
+            urls = res["result"]["result"]["value"] or []
+        except (KeyError, TypeError):
+            urls = []
+        return html, [u for u in urls if isinstance(u, str)][:50]
+    finally:
+        try:
+            cdp_send(sock, {"id": 999999, "method": "Target.closeTarget",
+                            "params": {"targetId": target_id}}, 5.0)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
 
 def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
-                max_depth: int = 2, js_bundles: int = 3
+                max_depth: int = 2, js_bundles: int = 3, cdp: str = ""
                 ) -> tuple[set[str], set[str], list[str]]:
     """Bounded BFS crawl for PHP surface. Returns (php_targets, visited).
     Seeds at `/`; follows same-origin HTML links (any href, not just .php)
@@ -981,6 +1174,31 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
                       if k.lower() == "content-type"), "").lower()
         new_targets = extract_links(body) - php_targets
         php_targets |= new_targets
+        if cdp:
+            try:
+                rhtml, rurls = cdp_rendered_page(cdp, base + path if path != "/" else url,
+                                                 timeout)
+                for t in extract_links(rhtml):
+                    if t not in php_targets:
+                        new_targets.add(t)
+                        php_targets.add(t)
+                for _u in rurls:
+                    try:
+                        from urllib.parse import urlparse as _up2
+                        _uu = _up2(_u)
+                        if _uu.hostname != host:
+                            continue
+                        _p = _uu.path or ""
+                        if _p.endswith(".php") and len(_p) < 128:
+                            php_targets.add(_p)
+                            new_targets.add(_p)
+                    except Exception:
+                        continue
+                if rhtml or rurls:
+                    trace(1, f"spider-cdp {base}{path} rendered={len(rhtml)}B "
+                              f"resources={len(rurls)} +{len(new_targets)}php")
+            except Exception as e:
+                trace(1, f"spider-cdp {base}{path} unavailable ({type(e).__name__})")
         trace(1, f"spider {base}{path} d={depth} {res.get('status')} "
                   f"({len(body)}B) +{len(new_targets)}php "
                   f"{sorted(new_targets) if new_targets else ''}")
@@ -1265,7 +1483,8 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   do_oracle: bool, phpinfo: bool, want_ptr: bool,
                   opener: urllib.request.OpenerDirector,
                   spider_pages: int = 10, spider_depth: int = 2,
-                  prove_rce: bool = False, host_budget: float = 120.0) -> list[Finding]:
+                  prove_rce: bool = False, host_budget: float = 120.0,
+                  cdp: str = "") -> list[Finding]:
     # Scheme negotiation: try BOTH http and https on EVERY port (appliances
     # serve TLS on :8443/:8006/:10443; plain-HTTP fronts hide TLS behind them).
     # http->https redirect stubs are followed to the upgrade target; findings
@@ -1361,12 +1580,12 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                         break
         if do_oracle and not over():
             try:
-                pos, ev = run_oracle(opener, url, timeout, spider_pages, spider_depth)
+                pos, ev = run_oracle(opener, url, timeout, spider_pages, spider_depth, cdp)
                 f.oracle_ran, f.oracle_positive, f.oracle_evidence = True, pos, ev
                 # surface which paths proved PHP execution even when silent
                 try:
                     _paths, _art = discover_php_paths(opener, url, timeout,
-                                                      spider_pages, spider_depth)
+                                                      spider_pages, spider_depth, cdp)
                     f.discovered_paths = _paths[1:]
                     for _sig in _art:
                         mark(f, _sig)
@@ -1680,6 +1899,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="max pages the site spider fetches per endpoint (default 10; 0 disables crawl, single-page harvest only)")
     ap.add_argument("--spider-depth", type=int, default=2,
                     help="max crawl depth from / (default 2). Aggressive: --spider-pages 50 --spider-depth 4")
+    ap.add_argument("--cdp", default="",
+                    help="optional CDP endpoint host:port for YOUR OWN Chromium "
+                         "(launch it: chromium --headless=new --remote-debugging-port=9222). "
+                         "Rendered DOM + loaded-resource URLs feed the spider. Disabled by default.")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (labs/self-signed)")
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="trace to stderr: -v per-phase lines (fingerprint/spider/discover/oracle/verdict), "
@@ -1800,7 +2023,8 @@ def main(argv: list[str] | None = None) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {ex.submit(scan_endpoint, h, p, args.timeout, args.insecure,
                           do_oracle, args.phpinfo, args.reverse_dns, opener,
-                          spider_pages, spider_depth, prove_rce, host_budget): (h, p)
+                          spider_pages, spider_depth, prove_rce, host_budget,
+                          args.cdp): (h, p)
                 for h, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             try:
