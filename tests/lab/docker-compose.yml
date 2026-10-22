@@ -106,3 +106,39 @@ services:
       - ./fpm-nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - fpm-backend
+  # SILENT-OBSCURE (limits demo): vuln 8.5.11 FPM, errors OFF, headers
+  # stripped, PHP reachable ONLY at /api/submit (no .php location block, so
+  # every candidate/app/deploy guess 404s at nginx; 404-differential stays
+  # negative). Safe probes go fully blind BY CONSTRUCTION — the documented
+  # case where only an unsafe OOM probe or --local can answer.
+  obscure-backend:
+    image: php:8.5.11-fpm
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1\nmemory_limit=64M' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && mkdir -p /var/www/html/api
+      && printf '<?php http_response_code(200); echo \"ok\";' > /var/www/html/api/submit.php
+      && printf '<html><head><title>Service</title></head><body>service</body></html>' > /var/www/html/index.html
+      && php-fpm"
+  obscure-front:
+    image: nginx:alpine
+    ports: ["19093:80"]
+    volumes:
+      - ./obscure-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - obscure-backend
+  # Patched control for the obscure pair: identical routing/shape, PHP 8.5.12.
+  obscure-fixed-backend:
+    image: php:8.5-fpm
+    command: >
+      bash -c "echo 'display_errors=Off\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1\nmemory_limit=64M' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && mkdir -p /var/www/html/api
+      && printf '<?php http_response_code(200); echo \"ok\";' > /var/www/html/api/submit.php
+      && printf '<html><head><title>Service</title></head><body>service</body></html>' > /var/www/html/index.html
+      && php-fpm"
+  obscure-fixed-front:
+    image: nginx:alpine
+    ports: ["19094:80"]
+    volumes:
+      - ./obscure-nginx-fixed.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - obscure-fixed-backend

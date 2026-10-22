@@ -60,8 +60,8 @@ Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 
 ## Test lab (transparency)
 
-`tests/lab/docker-compose.yml` spins 12 local scenarios; `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-21 — 40/40 green:
+`tests/lab/docker-compose.yml` spins 14 local scenarios; `tests/test_scanner.py`
+asserts every verdict live. Last verified 2026-10-22 — 41/41 green:
 
 | Service | Image | Result |
 |---|---|---|
@@ -74,6 +74,7 @@ asserts every verdict live. Last verified 2026-10-21 — 40/40 green:
 | pma (`:19090`) | phpMyAdmin on PHP 8.3.36 | PATCHED (app + version agree) |
 | wordpress-vuln (`:19089`) | WordPress, headers silent | PHP_NO_VERSION (WP assets prove PHP app) |
 | silent-errors-off (`:19091`) | php:8.5.11, zero disclosure | PHP_CANNOT_RULE_OUT (dynamic path, points at `--local`) |
+| obscure-vuln (`:19093`) / obscure-fixed (`:19094`) | FPM pair, PHP only at `/api/submit` | both NO_PHP_SIGNAL — the documented limits demo (safe probes blind by design) |
 | vuln-error-off (`:19082`) | php:8.5.11, errors off/hidden | NO_PHP_SIGNAL (fully silent CGI-like, documented) |
 | notphp (`:19085`) | nginx | NO_PHP_SIGNAL |
 | static-only (`:19086`) | no PHP handler at `/` | NO_PHP_SIGNAL |
@@ -81,9 +82,11 @@ asserts every verdict live. Last verified 2026-10-21 — 40/40 green:
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (40 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (41 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
+# limits demo (lab only — megabyte probes, expect worker impact):
+python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 ```
 
 ## Affected-product fleet (pressure test)

@@ -28,6 +28,8 @@ LAB = {  # service -> (port, expected_verdict)
     "pma": (19090, "PATCHED"),  # phpMyAdmin on PHP 8.3.36
     "silent-errors-off": (19091, "PHP_CANNOT_RULE_OUT"),  # dynamic path, zero disclosure
     "fpm-vuln": (19092, "VULNERABLE"),  # nginx->php-fpm 8.5.11, oracle through proxy
+    "obscure-vuln": (19093, "NO_PHP_SIGNAL"),  # PHP only at /api/submit; safe probes blind BY DESIGN
+    "obscure-fixed": (19094, "NO_PHP_SIGNAL"),  # patched twin: identical silence (control)
 }
 
 LIVE = os.environ.get("P2S_LIVE") == "1" or "--live" in sys.argv
@@ -275,6 +277,24 @@ class TestLiveLab(unittest.TestCase):
         self.assertTrue(pos_fpm)
         pos_nginx, _ = S.run_404_differential(self.opener, "http://127.0.0.1:19085/", 10)
         self.assertFalse(pos_nginx)
+        # obscure pair: nginx 404s everything identically -> negative on BOTH
+        # (this is the documented limits-demo: safe probes blind by design)
+        pos_ov, _ = S.run_404_differential(self.opener, "http://127.0.0.1:19093/", 10)
+        pos_of, _ = S.run_404_differential(self.opener, "http://127.0.0.1:19094/", 10)
+        self.assertFalse(pos_ov)
+        self.assertFalse(pos_of)
+
+    def test_obscure_pair_identical_silence(self):
+        # The limits demo, pinned: vuln 8.5.11 and patched 8.5.12 behind
+        # obscure routing are INDISTINGUISHABLE to safe probes. Both must be
+        # NO_PHP_SIGNAL (honest), never a fabricated verdict. See
+        # tests/lab/unsafe_413_demo.py for why the boundary probe must not ship.
+        fv = self._scan(19093)
+        ff = self._scan(19094)
+        self.assertEqual(fv.verdict, "NO_PHP_SIGNAL", fv.detail)
+        self.assertEqual(ff.verdict, "NO_PHP_SIGNAL", ff.detail)
+        self.assertFalse(fv.oracle_positive)
+        self.assertFalse(ff.oracle_positive)
 
     def test_local_enumerator(self):
         data = S.run_local_enum()

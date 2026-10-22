@@ -152,6 +152,31 @@ can name. Three things still work, and one authoritative fallback exists:
   For the "I can see php-cgi in ps but the network is silent" case this is
   the authoritative answer remote scanning can never give.
 
+### Layer D, worked example — the silent-obscure limits demo
+
+The repo ships a deployment where safe probes genuinely go blind, so the
+limitation is demonstrated, not asserted (`tests/lab/docker-compose.yml`:
+`obscure-*`; nginx config `tests/lab/obscure-nginx*.conf`):
+
+- **Shape.** PHP-FPM behind nginx, `display_errors=Off`, `expose_php=Off`,
+  no `Server` header, static `/`, PHP reachable ONLY at `/api/submit` (no
+  `.php` location block — every candidate/app/deploy guess 404s at nginx;
+  404-differential negative). Twin builds: **8.5.11 vuln** (`:19093`) and
+  **8.5.12 patched** (`:19094`), byte-identical routing.
+- **Safe-probe result (pinned in tests).** Both return `NO_PHP_SIGNAL`,
+  oracle negative on both. Indistinguishable — honestly reported.
+- **Unsafe demos (lab only, never shipped).**
+  `tests/lab/unsafe_probe_demo.py` (OOM size sweep): small bodies → both 200,
+  identical, no signal. `tests/lab/unsafe_413_demo.py` (boundary): at ~1.3 MB
+  wire the vuln answers 200 while the patched answers 413, stable 3/3 runs —
+  consistent with the patch's streaming `post_max_size` enforcement, but a
+  single-lab observation that moves with limits/SAPI/proxy. Four reasons it
+  must not ship are in that file's docstring (unproven generality, worker
+  harm, 413 ambiguity, CGI has no 619 channel). Divergence is observation,
+  not a version oracle.
+- **What DOES answer it.** `--local` on the box (`php -v` 8.5.11 vs 8.5.12),
+  or a staging clone with errors temporarily on.
+
 ## 5. Hardening / mitigation notes (not fixes)
 
 - Real fix: upgrade to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (or vendor backport),
