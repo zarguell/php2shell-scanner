@@ -263,15 +263,22 @@ limitation is demonstrated, not asserted (`tests/lab/docker-compose.yml`:
   `tests/lab/unsafe_probe_demo.py` (OOM size sweep): small bodies → both 200,
   identical, no signal — impact is not an oracle. `tests/lab/unsafe_413_demo.py`
   records a CAUTIONARY TALE: a 200-vs-413 split observed 3/3 once turned out to
-  be our own nginx misconfiguration (fixed-front briefly proxying the wrong
-  backend), and the same payload now returns 200/200 across bisection,
-  repeats, and fresh-worker restarts. Boundary behavior is environmental and
-  stateful — a line drawn on one afternoon's observation misfires on another's,
-  on identical containers. That failed replication is the finding: divergence
-  is observation, never a version oracle. Four no-ship reasons in that file.
-- **What DOES answer it.** `--local` on the box (`php -v` 8.5.11 vs 8.5.12),
-  or a staging clone with errors temporarily on.
-
+  be our own nginx misconfiguration; same payload now 200/200 across bisection,
+  repeats, fresh-worker restarts. Boundary behavior is environmental — a line
+  drawn on one afternoon's observation misfires on another's. Divergence is
+  observation, never a version oracle. Four no-ship reasons in that file.
+- **Contained RCE demo (authorized lab only, `tests/lab/rce_demo.py`).**
+  Public Chain-A primitive (session-injection + intentional LFI sink in
+  `vuln.php`): fixed marker-write payload (`file_put_contents` to
+  `/tmp/p2s-demo-*`, no shell, asserts pin the shape), execution proven by
+  marker FILE in the container (not HTTP echo — echo alone lies, observed
+  live), cleanup enforced and verified. Lab twins `:19110` (8.5.11) and
+  `:19111` (8.5.12): BOTH RCE-positive, as documented — the patch removes the
+  session-write warning path, NOT session injection or an app-layer LFI sink.
+  Scanner agrees per-twin (VULNERABLE oracle vs PATCHED oracle-negative).
+  Guardrails: hardcoded 127.0.0.1:19110/:19111 allowlist (no --target flag),
+  NOT imported by the scanner or default suite, `TestRceDemo` opt-in only
+  (`--rcedemo`). Run: compose up rce twins, `python3 tests/lab/rce_demo.py`.
 ## 5. Hardening / mitigation notes (not fixes)
 
 - Real fix: upgrade to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 (or vendor backport),

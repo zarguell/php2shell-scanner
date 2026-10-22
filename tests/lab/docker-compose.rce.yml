@@ -1,0 +1,23 @@
+# RCE-DEMO twins — AUTHORIZED LAB TESTING ONLY. Never expose publicly.
+# Chain A (session injection + LFI sink) against vuln 8.5.11 vs patched 8.5.12.
+# The PATCH does not remove session injection or the LFI sink (both are app/
+# config properties), so BOTH twins are expected RCE-positive here: the demo
+# proves the primitive end-to-end, and the patched twin proves the fix does
+# NOT paper over app-layer flaws. See tests/lab/rce_demo.py docstring.
+services:
+  rce-vuln:
+    image: php:8.5.11-apache
+    ports: ["19110:80"]
+    volumes:
+      - ./rce-demo:/var/www/html:ro
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1\nsession.upload_progress.cleanup=Off\nsession.save_path=/tmp' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && docker-php-entrypoint apache2-foreground"
+  rce-fixed:
+    image: php:8.5-apache
+    ports: ["19111:80"]
+    volumes:
+      - ./rce-demo:/var/www/html:ro
+    command: >
+      bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=On\nsession.upload_progress.enabled=1\nsession.upload_progress.cleanup=Off\nsession.save_path=/tmp' > /usr/local/etc/php/conf.d/zz-lab.ini
+      && docker-php-entrypoint apache2-foreground"

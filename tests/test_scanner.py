@@ -568,6 +568,36 @@ class TestAffectedFleet(unittest.TestCase):
                 self.assertNotIn(f.verdict, ("PATCHED", "NO_PHP_SIGNAL"))
 
 
+RCEDEMO = os.environ.get("P2S_RCEDEMO") == "1" or "--rcedemo" in sys.argv
+
+
+@unittest.skipUnless(RCEDEMO, "contained RCE demo, opt-in only (P2S_RCEDEMO=1 or --rcedemo)")
+class TestRceDemo(unittest.TestCase):
+    """AUTHORIZED LAB ONLY. Runs tests/lab/rce_demo.py (Chain-A marker write)
+    against the rce twins and asserts the documented outcome: BOTH twins
+    RCE-positive (the fix does not remove app-layer session injection or the
+    intentional LFI sink), markers cleaned, scanner agrees per-twin
+    (VULNERABLE oracle on 8.5.11, PATCHED oracle-negative on 8.5.12).
+    Never runs by default; never touches non-lab targets (script allowlists)."""
+    def test_contained_rce_both_twins(self):
+        import subprocess as _sp
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = _sp.run([sys.executable, "tests/lab/rce_demo.py"],
+                    capture_output=True, text=True, timeout=120, cwd=root)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-500:])
+        self.assertIn("RCE-POSITIVE", r.stdout)
+        self.assertIn("markers cleaned", r.stdout)
+
+    def test_scanner_agrees_per_twin(self):
+        op = S.make_opener(10, False)
+        fv = S.scan_endpoint("127.0.0.1", 19110, 10, False, True, False, False, op)
+        fv = next((f for f in fv if f.reachable), fv[0])
+        self.assertEqual(fv.verdict, "VULNERABLE", fv.detail)
+        ff = S.scan_endpoint("127.0.0.1", 19111, 10, False, True, False, False, op)
+        ff = next((f for f in ff if f.reachable), ff[0])
+        self.assertEqual(ff.verdict, "PATCHED", ff.detail)
+
+
 if __name__ == "__main__":
     if "--live" in sys.argv:
         sys.argv.remove("--live")
@@ -575,4 +605,7 @@ if __name__ == "__main__":
     if "--fleet" in sys.argv:
         sys.argv.remove("--fleet")
         os.environ["P2S_FLEET"] = "1"
+    if "--rcedemo" in sys.argv:
+        sys.argv.remove("--rcedemo")
+        os.environ["P2S_RCEDEMO"] = "1"
     unittest.main(verbosity=2)
