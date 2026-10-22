@@ -59,7 +59,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 20 local scenarios (18 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 71/71 green (live):
+asserts every verdict live. Last verified 2026-10-22 — 74/74 green (live; TestEvidence pins provenance):
 
 | Service | Image | Result |
 |---|---|---|
@@ -96,6 +96,15 @@ python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 # retarget to YOUR authorized box (double confirmation: typed echo + P2S_RCE_ARM=1):
 # P2S_RCE_ARM=1 python3 tests/lab/rce_demo.py --target 10.0.0.5:8080 --lfi-path /vuln.php --session-path /tmp
 ```
+
+## Reading a finding (evidence vs signals)
+
+`detail` cites POSITIVE evidence only — probes that fired
+(`body:app-plesk`, `app-plesk:login`, `panel-version:…=18.0.70`). Failed probes
+are labeled `(-)` (`cookie-grooming(-):…`, `404-differential(-):…`) and stay in
+`signals`/JSON for debugging, never in the verdict justification. The JSON
+`evidence` array lists exactly what the detail cites. If a detail ever cites a
+`(-)` line — or says PROVENANCE BUG — that's a scanner bug: report it.
 
 ## Timeout rules
 
