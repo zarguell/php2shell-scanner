@@ -156,6 +156,57 @@ class TestBehavioral(unittest.TestCase):
         self.assertIn("make_bare_opener", src)
 
 
+class TestRecap(unittest.TestCase):
+    """TLDR recap: counts, headline action, per-host lines."""
+    def _mk(self, host, port, verdict, version=None):
+        return S.Finding(target=f"{host}:{port}", host=host, port=port,
+                         scheme="http", url=f"http://{host}:{port}/",
+                         reachable=True, php_version=version, verdict=verdict)
+
+    def test_counts_and_action(self):
+        import io
+        fs = [self._mk("a", 80, "VULNERABLE", "8.5.11"),
+              self._mk("b", 80, "PATCHED", "8.5.12"),
+              self._mk("c", 80, "NO_PHP_SIGNAL")]
+        old = sys.stdout
+        try:
+            sys.stdout = buf = io.StringIO()
+            S.say_recap(fs)
+            out = buf.getvalue()
+        finally:
+            sys.stdout = old
+        self.assertIn("endpoints=3", out)
+        self.assertIn("VULNERABLE=1", out)
+        self.assertIn("action: patch PHP", out)
+        self.assertIn("a:80 -> VULNERABLE PHP 8.5.11", out)
+        self.assertIn("c:80 -> NO_PHP_SIGNAL", out)
+
+    def test_rce_headline_wins(self):
+        import io
+        fs = [self._mk("a", 80, "PATCHED", "8.5.12"),
+              self._mk("b", 80, "RCE-PROVEN")]
+        old = sys.stdout
+        try:
+            sys.stdout = buf = io.StringIO()
+            S.say_recap(fs)
+            out = buf.getvalue()
+        finally:
+            sys.stdout = old
+        self.assertIn("CONFIRMED RCE", out)
+
+    def test_quiet_headline(self):
+        import io
+        fs = [self._mk("a", 80, "PATCHED", "8.5.12")]
+        old = sys.stdout
+        try:
+            sys.stdout = buf = io.StringIO()
+            S.say_recap(fs)
+            out = buf.getvalue()
+        finally:
+            sys.stdout = old
+        self.assertIn("none required", out)
+
+
 class TestTimeouts(unittest.TestCase):
     """Timeout rules: pre-check, budgets, progress routing."""
     def test_precheck_closed_port_fast(self):

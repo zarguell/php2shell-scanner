@@ -59,7 +59,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 20 local scenarios (18 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 64/64 green (live; 58 unit-only):
+asserts every verdict live. Last verified 2026-10-22 — 71/71 green (live):
 
 | Service | Image | Result |
 |---|---|---|
@@ -82,11 +82,13 @@ asserts every verdict live. Last verified 2026-10-22 — 64/64 green (live; 58 u
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (64 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (71 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # trace what the spider saw (stderr; -vv adds every request):
 python3 php2shell_scanner.py -p 19097 127.0.0.1 -v
+# TLDR recap prints automatically after findings (counts + top action +
+# per-host one-liners) — pipe -v trace to stderr, read the recap on stdout
 # limits demo (lab only — megabyte probes, expect worker impact):
 python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 # contained RCE demo (marker-write, cleanup enforced — authorized testing):

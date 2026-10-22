@@ -95,6 +95,50 @@ def say(msg: str) -> None:
         print(msg, flush=True)
 
 
+def say_recap(findings: list) -> None:
+    """TLDR recap: verdict counts, top action, per-host one-liners.
+    Printed to stdout after findings (and honors --json? No: --json prints
+    raw data only; recap is a human-output feature. JSON consumers aggregate
+    verdict fields themselves)."""
+    from collections import Counter
+    counts: Counter = Counter(f.verdict for f in findings)
+    total = len(findings)
+    say("=== TLDR ===")
+    parts = [f"{v}={counts[v]}" for v in
+             ("RCE-PROVEN", "VULNERABLE", "LIKELY_VULNERABLE", "PHP_NO_VERSION",
+              "PHP_CANNOT_RULE_OUT", "PHP_UNKNOWN", "PATCHED", "TLS_UNTRUSTED",
+              "NO_PHP_SIGNAL", "UNREACHABLE") if counts.get(v)]
+    say(f"endpoints={total}" + (f" ({', '.join(parts)})" if parts else ""))
+    # top action: worst verdict present decides the headline
+    if counts.get("RCE-PROVEN"):
+        say("action: CONFIRMED RCE — isolate + patch PHP + remove LFI sink NOW")
+    elif counts.get("VULNERABLE"):
+        say("action: patch PHP to 8.2.35/8.3.36/8.4.27/8.5.12 NOW, restart workers, re-scan")
+    elif counts.get("LIKELY_VULNERABLE"):
+        say("action: confirm version, then patch as above (assume vulnerable until proven)")
+    elif counts.get("PHP_NO_VERSION") or counts.get("PHP_CANNOT_RULE_OUT"):
+        say("action: PHP present but undisclosed — run --local on the box or check vendor advisory")
+    elif counts.get("TLS_UNTRUSTED"):
+        say("action: TLS blocked verification — re-scan with --insecure to see behind it")
+    elif counts.get("PATCHED"):
+        say("action: none required (all fingerprinted hosts patched)")
+    else:
+        say("action: no PHP attack surface observed")
+    # per-host one-liners, worst-first (dedupes schemes: https preferred)
+    best: dict = {}
+    sev = {"RCE-PROVEN": -1, "VULNERABLE": 0, "LIKELY_VULNERABLE": 1,
+           "PHP_NO_VERSION": 2, "PHP_CANNOT_RULE_OUT": 2, "PHP_UNKNOWN": 3,
+           "PATCHED": 4, "TLS_UNTRUSTED": 5, "NO_PHP_SIGNAL": 6, "UNREACHABLE": 7}
+    for f in findings:
+        key = (f.host, f.port)
+        if key not in best or sev.get(f.verdict, 9) < sev.get(best[key].verdict, 9):
+            best[key] = f
+    for (h, p), f in sorted(best.items(),
+                            key=lambda kv: (sev.get(kv[1].verdict, 9), kv[0][0], kv[0][1])):
+        extra = f" PHP {f.php_version}" if f.php_version else ""
+        say(f"  {h}:{p} -> {f.verdict}{extra}")
+
+
 # ---------------------------------------------------------------- versions
 
 BARE_VER_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
@@ -1643,6 +1687,7 @@ def main(argv: list[str] | None = None) -> int:
         n_v = sum(1 for f in findings if f.verdict == "VULNERABLE")
         n_l = sum(1 for f in findings if f.verdict == "LIKELY_VULNERABLE")
         say(f"--- {len(findings)} endpoint(s): {n_v} VULNERABLE(oracle), {n_l} LIKELY_VULNERABLE(version) ---")
+        say_recap(findings)
     return 0 if not any(f.verdict in ("VULNERABLE", "LIKELY_VULNERABLE", "RCE-PROVEN") for f in findings) else 2
 
 
