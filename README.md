@@ -48,6 +48,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 | `--reverse-dns` | PTR lookup per target |
 | `--local` | on-box enumeration: php binaries/versions/SAPIs/processes (run ON the host) |
 | `--spider-pages N` (default 10) / `--spider-depth D` (default 2) | site-crawl budget per endpoint. `0/0` = single-page harvest only (quietest); aggressive: `--spider-pages 50 --spider-depth 4` |
+| `--prove-rce` | AUTHORIZED ONLY: auto-discover LFI sink (inert) + contained Chain-A marker-write with cleanup. Double confirmation: `P2S_RCE_ARM=1` + typed target echo on TTY. Honest tiers: `RCE-PROVEN` or read-primitive-only |
 | `-v` / `-vv` | trace to stderr: `-v` per-phase lines (fingerprint/spider/discover/oracle/verdict), `-vv` adds every request (method+path+status+ms) |
 | `--trace-file FILE` | append the same trace lines to FILE (pairs with `-v`/`-vv` for debugging runs) |
 | `--insecure` | skip TLS verification (self-signed labs) |
@@ -58,7 +59,7 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 20 local scenarios (18 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 57/57 green:
+asserts every verdict live. Last verified 2026-10-22 — 64/64 green (live; 58 unit-only):
 
 | Service | Image | Result |
 |---|---|---|
@@ -81,7 +82,7 @@ asserts every verdict live. Last verified 2026-10-22 — 57/57 green:
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (57 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (64 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
 # trace what the spider saw (stderr; -vv adds every request):

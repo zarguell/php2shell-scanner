@@ -585,6 +585,38 @@ class TestAffectedFleet(unittest.TestCase):
 RCEDEMO = os.environ.get("P2S_RCEDEMO") == "1" or "--rcedemo" in sys.argv
 
 
+class TestProveRce(unittest.TestCase):
+    """--prove-rce integration: LFI auto-discovery + contained proof wiring.
+    Runs against the RCE twins only (19110/19111); no confirmation needed
+    below the CLI layer (direct function calls, same as the CLI path after
+    double confirmation)."""
+    def test_lfi_sink_autodiscovered(self):
+        if not LIVE:
+            self.skipTest("needs live rce twins")
+        op = S.make_opener(10, False)
+        sinks = S.discover_lfi_sinks(op, "http://127.0.0.1:19110/", 10)
+        self.assertIn(("/vuln.php", "page"), sinks)
+
+    def test_prove_reports_honest_tier(self):
+        if not LIVE:
+            self.skipTest("needs live rce twins")
+        op = S.make_opener(10, False)
+        # suffix-less session include: read primitive proven, RCE unproven
+        # through echo — the scanner must say exactly that, never RCE-PROVEN.
+        ok, ev = S.prove_chain_a(op, "http://127.0.0.1:19110/", 10, ("/vuln.php", "page"))
+        self.assertFalse(ok)
+        self.assertIn("reads attacker session content", ev)
+        self.assertIn("RCE unproven", ev)
+
+    def test_prove_refusal_contract(self):
+        import inspect
+        src = inspect.getsource(S.main)
+        self.assertIn("P2S_RCE_ARM", src)
+        self.assertIn("isatty", src)
+        self.assertIn("--prove-rce", src)
+
+
+
 @unittest.skipUnless(RCEDEMO, "contained RCE demo, opt-in only (P2S_RCEDEMO=1 or --rcedemo)")
 class TestRceDemo(unittest.TestCase):
     def test_retarget_refusals(self):
