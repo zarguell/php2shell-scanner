@@ -186,13 +186,11 @@ class TestCdpHang(unittest.TestCase):
             try:
                 sock, tid, page_ws = S.cdp_ws_connect("127.0.0.1", port, 12)
                 try:
-                    psock, bsock, call, sess, _anote = S.cdp_scoped_driver(
-                        "127.0.0.1", port, tid, 12, page_ws_url=page_ws)
-                finally:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+                    sock.close()  # single-owner release, mirroring scans
+                except Exception:
+                    pass
+                psock, bsock, call, sess, _anote = S.cdp_scoped_driver(
+                    "127.0.0.1", port, tid, 12, page_ws_url=page_ws)
                 self.assertEqual(sess, "SESS1")
                 r = call("Page.enable")
                 self.assertIn("result", r)

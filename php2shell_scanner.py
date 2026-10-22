@@ -1353,6 +1353,14 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
     sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
+    # Single-owner rule (Edge/strict Chrome): the ws_connect page socket counts
+    # as an attached debugger, so attachToTarget from the browser session would
+    # be refused while it stays open. It is dead weight after the HTTP leg —
+    # the driver opens its own sockets — so release the target immediately.
+    try:
+        sock.close()
+    except Exception:
+        pass
     _psock = _bsock = None
     try:
         _psock, _bsock, call, _sess, _anote = cdp_scoped_driver(
@@ -1391,7 +1399,7 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
             urls = []
         return html, [u for u in urls if isinstance(u, str)][:50]
     finally:
-        for _s in (sock, _psock, _bsock):
+        for _s in (_psock, _bsock):
             try:
                 if _s is not None:
                     _s.close()
@@ -1411,6 +1419,14 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
     sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
+    # Single-owner rule (Edge/strict Chrome): the ws_connect page socket counts
+    # as an attached debugger, so attachToTarget from the browser session would
+    # be refused while it stays open. It is dead weight after the HTTP leg —
+    # the driver opens its own sockets — so release the target immediately.
+    try:
+        sock.close()
+    except Exception:
+        pass
     _psock = _bsock = None
     try:
         _psock, _bsock, call, _sess, _anote = cdp_scoped_driver(
@@ -1479,7 +1495,7 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
                 continue
         return html, res_urls, clicks, forms
     finally:
-        for _s in (sock, _psock, _bsock):
+        for _s in (_psock, _bsock):
             try:
                 if _s is not None:
                     _s.close()
@@ -1523,6 +1539,12 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
         return 1
     try:
         sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
+        # Same single-owner release as scans: the leg's page socket would
+        # block the driver's attachToTarget on Edge/strict builds.
+        try:
+            sock.close()
+        except Exception:
+            pass
         step("HTTP leg (/json/new)", True, f"target {target_id[:12]}…")
     except ConnectionError as e:
         step("HTTP leg (/json/new)", False, str(e)[:160])
@@ -1589,7 +1611,7 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
                 "or a headless firewall. Test navigate to http://127.0.0.1/ first.")
             return 1
     finally:
-        for _s in (sock, _psock, _bsock):
+        for _s in (_psock, _bsock):
             try:
                 if _s is not None:
                     _s.close()
