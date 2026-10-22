@@ -967,6 +967,8 @@ def parse_cdp_endpoint(cdp: str) -> tuple[str, int]:
         v = v[3:]  # tolerate ws:host:port/... and ws:/host:port/... pastes
     v = v.lstrip("/")
     host, sep, rest = v.partition(":")
+    if not sep and host.strip().isdigit():
+        return "127.0.0.1", int(host.strip())  # bare port ("9222")
     host = host.strip() or "127.0.0.1"
     port_s = rest.split("/", 1)[0].strip() if sep else ""
     if not port_s:
@@ -1050,9 +1052,14 @@ def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
     return raw, target_id
 
 
-def cdp_send(sock: socket.socket, payload: dict, timeout: float) -> dict:
+def cdp_send(sock: socket.socket, payload: dict, timeout: float,
+             call_timeout: float = 0) -> dict:
     """Send one JSON-RPC message as a single masked client text frame; read
-    frames until the matching id arrives (events interleaved are skipped)."""
+    frames until the matching id arrives (events interleaved are skipped).
+    call_timeout: absolute deadline for THIS call (default: timeout). On
+    expiry raises TimeoutError naming the method — never a bare hang."""
+    import time as _t
+    deadline = _t.monotonic() + (call_timeout or timeout)
     import json as _js
     import os as _os
     import struct as _st
@@ -1070,8 +1077,13 @@ def cdp_send(sock: socket.socket, payload: dict, timeout: float) -> dict:
     sock.sendall(hdr + bytes(b ^ mask[i % 4] for i, b in enumerate(raw)))
     import struct as _st2
     buf = b""
-    sock.settimeout(timeout)
+    sock.settimeout(min(timeout, 5.0))
     while True:
+        import time as _t2
+        if _t2.monotonic() >= deadline:
+            raise TimeoutError(f"CDP {payload.get('method')} no reply in "
+                               f"{call_timeout or timeout:.0f}s (browser alive, method hung — "
+                               "see --cdp-doctor navigate diagnostics)")
         while len(buf) < 2:
             chunk = sock.recv(65536)
             if not chunk:
@@ -1105,6 +1117,34 @@ def cdp_send(sock: socket.socket, payload: dict, timeout: float) -> dict:
             continue
         if isinstance(msg, dict) and msg.get("id") == payload.get("id"):
             return msg
+
+
+def cdp_session(sock: socket.socket, target_id: str, timeout: float
+                  ) -> tuple[str, object]:
+    """Attach to target; return (sessionId, call) where call(method, params)
+    prefixes the session id ('' prefix when the build needs none — attach is
+    harmless there). Raises with the failing method named."""
+    _mid = [0]
+
+    def _raw(method: str, params: dict | None = None) -> dict:
+        _mid[0] += 1
+        return cdp_send(sock, {"id": _mid[0], "method": method,
+                               "params": params or {}}, timeout)
+
+    try:
+        _r = _raw("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+        _sid = _r.get("result", {}).get("sessionId", "")
+    except Exception:
+        _sid = ""
+
+    def call(method: str, params: dict | None = None) -> dict:
+        _mid[0] += 1
+        _p = dict(params or {})
+        if _sid:
+            _p["sessionId"] = _sid
+        return cdp_send(sock, {"id": _mid[0], "method": method,
+                               "params": _p}, timeout)
+    return _sid, call
 
 
 def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
@@ -1180,12 +1220,7 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
     host, port = parse_cdp_endpoint(cdp)
     sock, target_id = cdp_ws_connect(host, port, timeout, token)
     try:
-        mid = [0]
-
-        def call(method: str, params: dict | None = None) -> dict:
-            mid[0] += 1
-            return cdp_send(sock, {"id": mid[0], "method": method,
-                                   "params": params or {}}, timeout)
+        _sid, call = cdp_session(sock, target_id, timeout)
         call("Page.enable")
         call("Runtime.enable")
         call("Network.enable")
@@ -1301,26 +1336,37 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
     except ConnectionError as e:
         step("HTTP leg (/json/new)", False, str(e)[:160])
         return 1
+    _sid, call = cdp_session(sock, target_id, timeout)
     try:
-        mid = [1000]
-
-        def call(method: str, params: dict | None = None) -> dict:
-            mid[0] += 1
-            return cdp_send(sock, {"id": mid[0], "method": method,
-                                   "params": params or {}}, timeout)
         r = call("Target.getTargets")
         try:
             n = len(r["result"]["targetInfos"])
         except (KeyError, TypeError):
             n = -1
         step("protocol round-trip (Target.getTargets)", True, f"{n} target(s)")
+    except Exception as e:
+        step("protocol round-trip (Target.getTargets)", False,
+             f"{type(e).__name__}: {str(e)[:160]}")
+        say("HINT: handshake + HTTP leg work but protocol hangs — the browser "
+            "may need Target.attachToTarget (now automatic), or a proxy/VPN "
+            "between scanner and browser is eating websocket frames. "
+            "Try --cdp 127.0.0.1:9222 on the SAME host as the browser first.")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return 1
+    try:
         call("Page.enable")
         call("Page.navigate", {"url": "about:blank"})
         import time as _t
         _t.sleep(1.0)
         step("tab navigate+close", True, "about:blank loaded")
     except Exception as e:
-        step("protocol/tab", False, f"{type(e).__name__}: {str(e)[:160]}")
+        step("tab navigate+close", False, f"{type(e).__name__}: {str(e)[:160]}")
+        say("HINT: protocol works but navigate hangs — the BROWSER's network "
+            "(not the scanner's) can't reach the URL: browser-side proxy/DNS, "
+            "or a headless firewall. Test navigate to http://127.0.0.1/ first.")
         try:
             sock.close()
         except Exception:

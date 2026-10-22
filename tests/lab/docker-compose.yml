@@ -261,4 +261,6 @@ services:
       bash -c "echo 'display_errors=On\nlog_errors=Off\nexpose_php=Off\nsession.upload_progress.enabled=1' > /usr/local/etc/php/conf.d/zz-lab.ini
       && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"results:\" . htmlspecialchars($$q);' > /var/www/html/search.php
       && printf '<?php echo \"login-ok\";' > /var/www/html/login.php
+      && mkdir -p /var/www/html/query
+      && printf '<?php $$q = $$_GET[\"q\"] ?? \"\"; echo \"query:\" . htmlspecialchars($$q);' > /var/www/html/query/index.php
       && docker-php-entrypoint apache2-foreground"
