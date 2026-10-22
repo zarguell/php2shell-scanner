@@ -175,10 +175,10 @@ class TestCdpHang(unittest.TestCase):
             _t.sleep(0.3)
             psock = bsock = None
             try:
-                sock, tid = S.cdp_ws_connect("127.0.0.1", port, 12)
+                sock, tid, page_ws = S.cdp_ws_connect("127.0.0.1", port, 12)
                 try:
-                    psock, bsock, call, sess = S.cdp_scoped_driver(
-                        "127.0.0.1", port, tid, 12)
+                    psock, bsock, call, sess, _anote = S.cdp_scoped_driver(
+                        "127.0.0.1", port, tid, 12, page_ws_url=page_ws)
                 finally:
                     try:
                         sock.close()
@@ -277,7 +277,7 @@ class TestCdpHang(unittest.TestCase):
         self.assertTrue(started.wait(timeout=10))
         _t.sleep(0.3)
         t0 = _t.monotonic()
-        sock, tid = S.cdp_ws_connect("127.0.0.1", 19298, 12)
+        sock, tid, _page_ws = S.cdp_ws_connect("127.0.0.1", 19298, 12)
         sid, call = S.cdp_session(sock, tid, 12)
         dt = _t.monotonic() - t0
         try:

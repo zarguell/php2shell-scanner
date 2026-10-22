@@ -984,9 +984,11 @@ def parse_cdp_endpoint(cdp: str) -> tuple[str, int]:
 
 
 def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
-                   ) -> tuple[socket.socket, str]:
+                   ) -> tuple[socket.socket, str, str]:
     """Open a CDP target session: GET /json/new -> webSocketDebuggerUrl ->
-    RFC 6455 client handshake. Returns (connected socket, target id).
+    RFC 6455 client handshake. Returns (connected socket, target id,
+    webSocketDebuggerUrl — the server-advertised page path, needed because
+    strict builds may key it beyond the bare targetId).
     token: DevTools token some Chromium builds require (from
     --remote-debugging-token=... or the browser's stderr "token=" line);
     sent as Bearer on the HTTP leg and Authorization on the websocket."""
@@ -1049,18 +1051,26 @@ def cdp_ws_connect(host: str, port: int, timeout: float, token: str = ""
         head += chunk
     if b" 101 " not in head.split(b"\r\n", 1)[0]:
         raise ConnectionError(f"CDP handshake rejected: {head[:80]!r}")
-    return raw, target_id
+    return raw, target_id, ws_url
 
 
 def cdp_ws_page_socket(host: str, port: int, target_id: str, timeout: float,
-                       token: str = "") -> socket.socket:
-    """Raw websocket to an EXISTING page target (/devtools/page/<target_id>).
-    No HTTP leg, no new tab — dials the known path directly. Used by
-    cdp_scoped_driver after the browser-session attach."""
+                       token: str = "", ws_url: str = "") -> socket.socket:
+    """Raw websocket to an EXISTING page target. Prefers the server-advertised
+    webSocketDebuggerUrl from /json/new (strict builds may key the path with a
+    suffix beyond the bare targetId); falls back to /devtools/page/<target_id>.
+    No HTTP leg, no new tab. Used by cdp_scoped_driver after the
+    browser-session attach."""
     import base64 as _b64p
     from urllib.parse import quote as _q
-    _path = "/devtools/page/" + _q(target_id, safe="")
-    _raw = socket.create_connection((host, port), timeout=timeout)
+    from urllib.parse import urlparse as _upp
+    if ws_url:
+        _u = _upp(ws_url)
+        _path = _u.path + (("?" + _u.query) if _u.query else "")
+    else:
+        _path = "/devtools/page/" + _q(target_id, safe="")
+    _raw = socket.create_connection((host, _u.port or port if ws_url else port),
+                                     timeout=timeout)
     _raw.settimeout(timeout)
     _key = _b64p.b64encode(bytes(__import__("os").urandom(16))).decode()
     _auth = f"Authorization: Bearer {token}\r\n" if token else ""
@@ -1132,10 +1142,13 @@ def cdp_browser_session(host: str, port: int, timeout: float, token: str = ""
 
 
 def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
-                      token: str = "") -> tuple[socket.socket, socket.socket, object, str]:
+                      token: str = "", page_ws_url: str = "") -> tuple[socket.socket, socket.socket, object, str, str]:
     """One correctly-scoped driver for a page target. Returns
-    (page_sock, browser_sock, call, sessionId) where call(method, params) sends
-    Page/Runtime/Network methods session-scoped over the page socket.
+    (page_sock, browser_sock, call, sessionId, attach_note) where call(method,
+    params) sends Page/Runtime/Network methods session-scoped over the page
+    socket. attach_note is "" on success, else the raw attach failure (reply
+    text or exception — surfaced by --cdp-doctor so strict-build behavior is
+    diagnosable, never a bare 'no sessionId').
     Strict builds route Target.* ONLY on the browser session and Page.* ONLY
     with the attach sessionId; lenient builds accept either, so this shape
     works everywhere. attach runs over the browser session with a 5s deadline
@@ -1186,6 +1199,7 @@ def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
         return cdp_send(_bsock, {"id": _bmid[0], "method": method,
                                  "params": params or {}}, timeout)
     _sid = ""
+    _attach_note = ""
     try:
         _bmid[0] += 1
         _ar = cdp_send(_bsock, {"id": _bmid[0],
@@ -1193,9 +1207,13 @@ def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
                                 "params": {"targetId": target_id, "flatten": True}},
                        timeout, call_timeout=min(5.0, timeout))
         _sid = _ar.get("result", {}).get("sessionId", "")
+        if not _sid:
+            _attach_note = f"attach reply had no sessionId: {str(_ar)[:200]}"
+            trace(1, f"cdp attach: {_attach_note}")
     except Exception as _e:
-        trace(2, f"cdp attach skipped ({type(_e).__name__}: {str(_e)[:100]}), sessionless mode")
-    _psock = cdp_ws_page_socket(host, port, target_id, timeout, token)
+        _attach_note = f"{type(_e).__name__}: {str(_e)[:160]}"
+        trace(1, f"cdp attach failed: {_attach_note}")
+    _psock = cdp_ws_page_socket(host, port, target_id, timeout, token, page_ws_url)
     _pmid = [0]
 
     def _call(method: str, params: dict | None = None) -> dict:
@@ -1205,7 +1223,7 @@ def cdp_scoped_driver(host: str, port: int, target_id: str, timeout: float,
             _p["sessionId"] = _sid
         return cdp_send(_psock, {"id": _pmid[0], "method": method,
                                  "params": _p}, timeout)
-    return _psock, _bsock, _call, _sid
+    return _psock, _bsock, _call, _sid, _attach_note
 
 
 def cdp_send(sock: socket.socket, payload: dict, timeout: float,
@@ -1320,11 +1338,11 @@ def cdp_rendered_page(cdp: str, page_url: str, timeout: float,
     as 'browser unavailable for this page', falls back to plain HTTP)."""
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
-    sock, target_id = cdp_ws_connect(host, port, timeout, token)
+    sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
     _psock = _bsock = None
     try:
-        _psock, _bsock, call, _sess = cdp_scoped_driver(
-            host, port, target_id, timeout, token)
+        _psock, _bsock, call, _sess, _anote = cdp_scoped_driver(
+            host, port, target_id, timeout, token, page_ws_url)
         call("Page.enable")
         call("Runtime.enable")
         call("Page.navigate", {"url": page_url})
@@ -1378,11 +1396,11 @@ def cdp_full_crawl(cdp: str, page_url: str, timeout: float, token: str = "",
     (caller falls back to plain HTTP)."""
     import json as _js
     host, port = parse_cdp_endpoint(cdp)
-    sock, target_id = cdp_ws_connect(host, port, timeout, token)
+    sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
     _psock = _bsock = None
     try:
-        _psock, _bsock, call, _sess = cdp_scoped_driver(
-            host, port, target_id, timeout, token)
+        _psock, _bsock, call, _sess, _anote = cdp_scoped_driver(
+            host, port, target_id, timeout, token, page_ws_url)
         call("Page.enable")
         call("Runtime.enable")
         call("Network.enable")
@@ -1490,7 +1508,7 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
             "Check http://127.0.0.1:9222/json/version in curl first.")
         return 1
     try:
-        sock, target_id = cdp_ws_connect(host, port, timeout, token)
+        sock, target_id, page_ws_url = cdp_ws_connect(host, port, timeout, token)
         step("HTTP leg (/json/new)", True, f"target {target_id[:12]}…")
     except ConnectionError as e:
         step("HTTP leg (/json/new)", False, str(e)[:160])
@@ -1522,8 +1540,8 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
             return 1
         step("protocol round-trip (Target.getTargets)", True, f"{_n} target(s) via browser session")
         try:
-            _psock, _bsock2, call, _sess = cdp_scoped_driver(
-                host, port, target_id, timeout, token)
+            _psock, _bsock2, call, _sess, _anote = cdp_scoped_driver(
+                host, port, target_id, timeout, token, page_ws_url)
             try:
                 _bsock.close()
             except Exception:
@@ -1531,10 +1549,11 @@ def cdp_doctor(cdp: str, token: str, timeout: float) -> int:
             _bsock = _bsock2
             if not _sess:
                 step("tab navigate+close", False,
-                     "attach returned no sessionId (strict build needs one)")
+                     f"attach yielded no sessionId — {_anote[:200] or 'no detail captured'}")
                 say("HINT: Target.getTargets works but attachToTarget yields no "
-                    "session — this build scopes tabs in a way the scanner cannot "
-                    "drive. Plain-HTTP spider still runs; --crawl-full is unavailable.")
+                    "session. The note above is the browser's raw reply — paste it "
+                    "verbatim for diagnosis. Plain-HTTP spider still runs; "
+                    "--crawl-full is unavailable.")
                 return 1
             call("Page.enable")
         except Exception as e:
