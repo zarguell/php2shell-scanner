@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Limits demo, part 2 — the 413-divergence boundary probe (LAB ONLY).
+"""Limits demo, part 2 — the 413-divergence that WASN'T (LAB ONLY).
 
-Observed (2026-10-22, obscure pair, identical nginx/post_max_size=8M):
-  ~1.3 MB duplicate-header multipart POST, NO upload-progress field:
-    vuln 8.5.11   -> HTTP 200 (3/3 runs)
-    patched 8.5.12 -> HTTP 413 (3/3 runs)
-  At 360KB and 720KB both answer 200.
+History: on 2026-10-22 this script once showed, 3/3 runs, ~1.3 MB
+duplicate-header multipart POST with NO upload-progress field:
+  vuln 8.5.11 -> HTTP 200, patched 8.5.12 -> HTTP 413.
+On revisit the SAME pair, SAME payload returns 200/200 across 6+ runs,
+bisection 703–1289 KB, and fresh-worker restarts. Root cause of the original
+split: the fixed-front container was briefly mounted with the WRONG nginx
+config (upstream pointed at the vuln backend / stale 1m client_max), i.e.
+lab-operator error, not a PHP behavior difference. The "divergence" was an
+artifact — kept in git history as a cautionary tale.
 
-Hypothesis (consistent with dinosn's patch-gap analysis): the 8.5.12 patch's
-streaming post_max_size enforcement + unknown-header filtering rejects the
-inflated body where unpatched PHP parses it. This LOOKS like a version
-oracle for silent boxes — and this script exists to show why it is NOT one
-you should trust or ship:
-
-  1. It is a single lab observation (one build pair, one SAPI, one config).
-     post_max_size, memory_limit, SAPI buffering, proxy limits, and request
-     sizing all move the threshold. A 200-vs-413 line drawn here will misfire
-     elsewhere — in BOTH directions.
+That failed replication IS the finding, and it strengthens the no-ship case:
+  1. Boundary behavior is stateful and environmental (worker memory state,
+     proxy config drift, SAPI buffering). A 200-vs-413 line drawn on one
+     afternoon's observation misfires on another afternoon's — in BOTH
+     directions, on IDENTICAL containers.
   2. It requires sending megabytes to production workers. That is a DoS
      probe wearing a lab coat: on small memory_limit / single-worker pools it
      degrades or kills workers. The demo pair has memory_limit=64M and
@@ -28,9 +27,9 @@ you should trust or ship:
   4. CGI has no persistent worker, so half the CVE class (619 stale state)
      does not apply there — yet this probe cannot tell CGI from FPM.
 
-Verdict policy: the scanner MUST NOT implement this. If YOU run it against a
-box you own, treat any divergence as "interesting, investigate locally with
---local" — never as a version verdict.
+Verdict policy: the scanner MUST NOT implement this. If YOU observe a 413
+split against a box you own, check YOUR proxy config first (we failed this
+ourselves), then investigate locally with --local — never as a version verdict.
 
 Usage (lab only, obscure pair must be up):
     python3 tests/lab/unsafe_413_demo.py [--wire-kb 1289 --trials 3]

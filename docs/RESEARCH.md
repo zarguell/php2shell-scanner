@@ -167,13 +167,14 @@ limitation is demonstrated, not asserted (`tests/lab/docker-compose.yml`:
   oracle negative on both. Indistinguishable — honestly reported.
 - **Unsafe demos (lab only, never shipped).**
   `tests/lab/unsafe_probe_demo.py` (OOM size sweep): small bodies → both 200,
-  identical, no signal. `tests/lab/unsafe_413_demo.py` (boundary): at ~1.3 MB
-  wire the vuln answers 200 while the patched answers 413, stable 3/3 runs —
-  consistent with the patch's streaming `post_max_size` enforcement, but a
-  single-lab observation that moves with limits/SAPI/proxy. Four reasons it
-  must not ship are in that file's docstring (unproven generality, worker
-  harm, 413 ambiguity, CGI has no 619 channel). Divergence is observation,
-  not a version oracle.
+  identical, no signal — impact is not an oracle. `tests/lab/unsafe_413_demo.py`
+  records a CAUTIONARY TALE: a 200-vs-413 split observed 3/3 once turned out to
+  be our own nginx misconfiguration (fixed-front briefly proxying the wrong
+  backend), and the same payload now returns 200/200 across bisection,
+  repeats, and fresh-worker restarts. Boundary behavior is environmental and
+  stateful — a line drawn on one afternoon's observation misfires on another's,
+  on identical containers. That failed replication is the finding: divergence
+  is observation, never a version oracle. Four no-ship reasons in that file.
 - **What DOES answer it.** `--local` on the box (`php -v` 8.5.11 vs 8.5.12),
   or a staging clone with errors temporarily on.
 
