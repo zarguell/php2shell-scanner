@@ -141,6 +141,44 @@ class TestBehavioral(unittest.TestCase):
         self.assertIn("make_bare_opener", src)
 
 
+class TestVerbose(unittest.TestCase):
+    """Verbose tracing: exact line shapes, stderr routing, level gating."""
+    def test_level_gating_off_by_default(self):
+        self.assertEqual(S._TRACE_LEVEL, 0)
+
+    def test_trace_lines_exact_shape(self):
+        import io
+        old_level, old_err = S._TRACE_LEVEL, sys.stderr
+        try:
+            S._TRACE_LEVEL = 1
+            sys.stderr = buf = io.StringIO()
+            S.trace(1, "spider http://x/ d=0 200 (10B) +0php ")
+            S.trace(2, "req GET http://x/ -> 200 (1ms, 10B)")
+            out = buf.getvalue()
+            self.assertIn("spider http://x/ d=0 200 (10B) +0php", out)
+            self.assertNotIn("req GET", out)  # level 2 hidden at -v
+            S._TRACE_LEVEL = 2
+            S.trace(2, "req GET http://x/ -> 200 (1ms, 10B)")
+            self.assertIn("req GET http://x/ -> 200 (1ms, 10B)", buf.getvalue())
+        finally:
+            S._TRACE_LEVEL, sys.stderr = old_level, old_err
+
+    def test_trace_file_mirror(self):
+        import tempfile
+        old_level = S._TRACE_LEVEL
+        try:
+            with tempfile.NamedTemporaryFile("r+", suffix=".log", delete=True) as fh:
+                S._TRACE_LEVEL = 1
+                S._trace_fh = open(fh.name, "a", encoding="utf-8")
+                S.trace(1, "verdict http://x:80 -> VULNERABLE (high) :: detail")
+                S._trace_fh.close()
+                S._trace_fh = None
+                fh.seek(0)
+                self.assertIn("verdict http://x:80", fh.read())
+        finally:
+            S._TRACE_LEVEL = old_level
+            S._trace_fh = None
+
 class TestFingerprint(unittest.TestCase):
     """Pressure battery: every fingerprint the server may leak."""
     def fp(self, headers=None, body=""):

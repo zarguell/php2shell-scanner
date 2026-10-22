@@ -48,10 +48,9 @@ found, 0 when clean, 1 on usage errors. Stdlib only — no dependencies.
 | `--reverse-dns` | PTR lookup per target |
 | `--local` | on-box enumeration: php binaries/versions/SAPIs/processes (run ON the host) |
 | `--spider-pages N` (default 10) / `--spider-depth D` (default 2) | site-crawl budget per endpoint. `0/0` = single-page harvest only (quietest); aggressive: `--spider-pages 50 --spider-depth 4` |
+| `-v` / `-vv` | trace to stderr: `-v` per-phase lines (fingerprint/spider/discover/oracle/verdict), `-vv` adds every request (method+path+status+ms) |
+| `--trace-file FILE` | append the same trace lines to FILE (pairs with `-v`/`-vv` for debugging runs) |
 | `--insecure` | skip TLS verification (self-signed labs) |
-| `--timeout`, `--threads` | per-request seconds (default 8), concurrency (default 16) |
-
-Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 `PATCHED` · `PHP_NO_VERSION` (PHP proven, version hidden) ·
 `PHP_CANNOT_RULE_OUT` (dynamic PHP path, zero identity — run `--local`) ·
 `PHP_UNKNOWN` · `NO_PHP_SIGNAL` · `UNREACHABLE`.
@@ -59,7 +58,7 @@ Verdicts: `VULNERABLE` (oracle 3/3) · `LIKELY_VULNERABLE` (old/EOL version) ·
 ## Test lab (transparency)
 
 `tests/lab/docker-compose.yml` spins 19 local scenarios (17 lab services + TLS/downgrade); `tests/test_scanner.py`
-asserts every verdict live. Last verified 2026-10-22 — 53/53 green (+2 scheme unit tests):
+asserts every verdict live. Last verified 2026-10-22 — 56/56 green:
 
 | Service | Image | Result |
 |---|---|---|
@@ -81,9 +80,11 @@ asserts every verdict live. Last verified 2026-10-22 — 53/53 green (+2 scheme 
 ```sh
 docker compose -f tests/lab/docker-compose.yml up -d
 python3 tests/test_scanner.py          # unit tests (no network)
-python3 tests/test_scanner.py --live   # unit + live lab (55 tests)
+python3 tests/test_scanner.py --live   # unit + live lab (56 tests)
 # on the box itself (answers "what runs PHP here" authoritatively):
 python3 php2shell_scanner.py --local
+# trace what the spider saw (stderr; -vv adds every request):
+python3 php2shell_scanner.py -p 19097 127.0.0.1 -v
 # limits demo (lab only — megabyte probes, expect worker impact):
 python3 tests/lab/unsafe_probe_demo.py && python3 tests/lab/unsafe_413_demo.py
 ```

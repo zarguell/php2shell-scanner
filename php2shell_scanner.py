@@ -71,6 +71,23 @@ PHPINFO_VER_RE = re.compile(r"PHP Version\s*(?:</[^>]*>\s*<[^>]*>\s*)?(\d+)\.(\d
 
 print_lock = threading.Lock()
 
+# Verbose tracing: -v logs per-endpoint phase lines to stderr (thread-safe,
+# ordered per line, never interleaved mid-line); -vv adds per-request lines
+# (every GET/POST with method+path+status+ms). Level 0 = findings only.
+# Tests assert exact line shapes via run with --verbose (see TestVerbose).
+_TRACE_LEVEL = 0
+_trace_fh = None
+def trace(level: int, msg: str) -> None:
+    if _TRACE_LEVEL >= level:
+        with print_lock:
+            print(msg, flush=True, file=sys.stderr)
+            fh = globals().get("_trace_fh")
+            if fh is not None:
+                try:
+                    fh.write(msg + "\n")
+                except Exception:
+                    pass
+
 
 def say(msg: str) -> None:
     with print_lock:
@@ -167,21 +184,27 @@ def make_bare_opener(timeout: float, insecure: bool) -> urllib.request.OpenerDir
 def http_request(opener, url: str, timeout: float, method="GET",
                  data: bytes | None = None, headers: dict | None = None,
                  max_bytes: int = 300_000) -> dict:
+    import time as _t
     req = urllib.request.Request(url, data=data, headers={
         "User-Agent": UA, "Accept": "*/*", "Connection": "close",
         **(headers or {}),
     }, method=method)
+    t0 = _t.monotonic()
     try:
         resp = opener.open(req, timeout=timeout)
         body = resp.read(max_bytes)
+        ms = int((_t.monotonic() - t0) * 1000)
+        trace(2, f"req {method} {url} -> {resp.status} ({ms}ms, {len(body)}B)")
         return {"status": resp.status, "headers": dict(resp.headers.items()),
                 "body": body.decode("utf-8", "replace"), "url": resp.geturl()}
     except urllib.error.HTTPError as e:
+        ms = int((_t.monotonic() - t0) * 1000)
         try:
             body = e.read(60_000)
         except Exception:
             body = b""
         hdrs = dict(e.headers.items()) if e.headers else {}
+        trace(2, f"req {method} {url} -> HTTP {e.code} ({ms}ms)")
         out = {"status": e.code, "headers": hdrs,
                "body": body.decode("utf-8", "replace"), "url": url}
         # redirect stub? surface where it points (caller may follow/upgrade)
@@ -191,7 +214,9 @@ def http_request(opener, url: str, timeout: float, method="GET",
                 out["redirect_to"] = loc
         return out
     except Exception as e:
+        ms = int((_t.monotonic() - t0) * 1000)
         err = f"{type(e).__name__}: {e}"
+        trace(2, f"req {method} {url} -> ERROR {type(e).__name__} ({ms}ms)")
         out = {"status": None, "error": err, "url": url}
         # TLS present but untrusted (self-signed appliance)? Tell the operator
         # to retry with --insecure instead of reporting plain UNREACHABLE.
@@ -393,6 +418,8 @@ def discover_php_paths(opener, url: str, timeout: float,
     except Exception:
         crawled = []
     ordered = list(dict.fromkeys(sorted(spider_targets) + crawled + list(PHP_PATH_CANDIDATES) + list(CONVENTIONAL_PHP)))
+    trace(1, f"discover {base}: {len(spider_targets)} spider + {len(crawled)} harvest + "
+              f"{len(PHP_PATH_CANDIDATES) + len(CONVENTIONAL_PHP)} static candidates")
     for p in ordered[:40]:  # cap: spider first, static guesses after
         target = base + p if p != "/" else url
         try:
@@ -401,6 +428,7 @@ def discover_php_paths(opener, url: str, timeout: float,
                 continue  # no such path — never a PHP endpoint here
             if looks_like_php_response(res):
                 found.append(p)
+                trace(1, f"discover {base}{p}: PHP-PROVEN (header/cookie/redirect)")
                 continue
             if res.get("status") == 200 and p.endswith(".php"):
                 body1 = res.get("body") or ""
@@ -453,8 +481,10 @@ def run_oracle(opener, url: str, timeout: float, spider_pages: int = 10,
         hits = [m for m in ORACLE_MARKERS if m in text]
         last_ev = (f"oracle markers {len(hits)}/{len(ORACLE_MARKERS)}"
                    + (f": {hits}" if hits else "") + f" (HTTP {res.get('status')}, path {p})")
+        trace(1, f"oracle {base}{p}: {len(hits)}/3 markers (HTTP {res.get('status')})")
         if len(hits) == len(ORACLE_MARKERS):
             return True, last_ev
+    trace(1, f"oracle {base}: negative across {len(paths)} path(s)")
     return False, last_ev
 
 
@@ -720,8 +750,11 @@ def spider_site(opener, url: str, timeout: float, max_pages: int = 10,
         body = res.get("body") or ""
         ctype = next((v for k, v in res.get("headers", {}).items()
                       if k.lower() == "content-type"), "").lower()
-        for t in extract_links(body):
-            php_targets.add(t)
+        new_targets = extract_links(body) - php_targets
+        php_targets |= new_targets
+        trace(1, f"spider {base}{path} d={depth} {res.get('status')} "
+                  f"({len(body)}B) +{len(new_targets)}php "
+                  f"{sorted(new_targets) if new_targets else ''}")
         # missing content-type on a non-empty text body: treat as followable
         # (extensionless static files often serve without ctype; the dynamic
         # test later decides per-path — following is harmless, all plain GETs)
@@ -925,7 +958,8 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         f.reachable = True
         f.http_status = res["status"]
         ver, src, sigs, branch_only = fingerprint_response(res)
-        f.signals.extend(sigs)
+        trace(1, f"fingerprint {url}: HTTP {res.get('status')} "
+                  f"version={ver or '-'} src={src or '-'} signals={len(sigs)}")
         if ver:
             f.php_detected = True
             f.php_version = ver
@@ -1037,7 +1071,10 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
                 # generic dynamic-handler evidence, no PHP proof: still not
                 # PHP verdict — but record the count for the operator.
                 f.signals.append(f"behavioral-corroboration:{corroborate}")
-        out.append(decide(f))
+        decided = decide(f)
+        out.append(decided)
+        trace(1, f"verdict {decided.scheme}://{host}:{port} -> {decided.verdict} "
+                  f"({decided.confidence}) :: {(decided.detail or '')[:100]}")
     # Dedupe: one service yields one Finding. Prefer the https finding when
     # both schemes answered (appliance TLS behind plain-HTTP front); prefer
     # any reachable over unreachable; keep both only if genuinely different
@@ -1048,6 +1085,7 @@ def scan_endpoint(host: str, port: int, timeout: float, insecure: bool,
         if https_f is not None and http_f is not None:
             if https_f.verdict == http_f.verdict and https_f.php_version == http_f.php_version:
                 https_f.signals.append("scheme:both-http-and-https")
+                trace(1, f"dedupe {host}:{port}: identical http+https -> one finding")
                 return [https_f]
     return out
 
@@ -1186,10 +1224,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--spider-depth", type=int, default=2,
                     help="max crawl depth from / (default 2). Aggressive: --spider-pages 50 --spider-depth 4")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (labs/self-signed)")
+    ap.add_argument("-v", "--verbose", action="count", default=0,
+                    help="trace to stderr: -v per-phase lines (fingerprint/spider/discover/oracle/verdict), "
+                         "-vv adds every request (method+path+status+ms)")
+    ap.add_argument("--trace-file", help="also append trace lines to FILE (same content as stderr)")
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("-o", "--output", help="write results (JSON) to file")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     args = ap.parse_args(argv)
+    global _TRACE_LEVEL, _trace_fh
+    _TRACE_LEVEL = min(args.verbose, 2)
+    _trace_fh = None
+    if args.trace_file:
+        _trace_fh = open(args.trace_file, "a", encoding="utf-8")
     if args.version:
         print(f"php2shell-scanner {TOOL_VERSION}")
         return 0

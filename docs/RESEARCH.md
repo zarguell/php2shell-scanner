@@ -223,6 +223,13 @@ regardless of vendor — plus a harvester that learns the site's own surface:
   NOT a verdict escalator: generic dynamic-handler evidence is not PHP
   evidence, and the obscure-pair test pins that NO_PHP_SIGNAL stands.
 
+Debugging any of the above: `-v` traces every phase to stderr
+(fingerprint → spider page visits with `+Nphp` finds → discover candidate
+counts → oracle markers per path → verdict), `-vv` adds every request
+(method+path+status+ms+bytes), `--trace-file` mirrors it to disk. Findings
+stay on stdout — trace never pollutes piped JSON. Line shapes are pinned in
+`TestVerbose`.
+
 ### Layer G — scheme negotiation: both protocols, upgrades, TLS honesty
 
 The old logic (HTTP-only on :80, HTTPS-only on :443, stop after HTTP answers)
