@@ -761,6 +761,50 @@ class TestCdpBridge(unittest.TestCase):
         self.assertIn("<html", html.lower())
         self.assertTrue(any("loader.js" in u for u in urls), urls)
 
+    def test_token_gate_refused_without_token(self):
+        # fake token-gated CDP HTTP leg: no/wrong token -> 401 with hint;
+        # right token -> HTTP leg passes (Bearer forwarded).
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        seen = {}
+
+        class Gated(BaseHTTPRequestHandler):
+            def _gate(self):
+                return self.headers.get("Authorization", "") == "Bearer sekrit"
+            def _serve(self):
+                seen["auth"] = self.headers.get("Authorization", "")
+                if not self._gate():
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b"unauthorized")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"T1","webSocketDebuggerUrl":"ws://127.0.0.1:9/x"}')
+            def do_PUT(self):
+                self._serve()
+            do_GET = do_PUT
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 19224), Gated)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(ConnectionError) as cm:
+                S.cdp_ws_connect("127.0.0.1", 19224, 5)
+            self.assertIn("401", str(cm.exception))
+            self.assertIn("--cdp-token", str(cm.exception))
+            with self.assertRaises(ConnectionError) as cm2:
+                S.cdp_ws_connect("127.0.0.1", 19224, 5, token="wrong")
+            self.assertIn("401", str(cm2.exception))
+            # right token passes HTTP leg (ws dial to :9 then fails — expected)
+            with self.assertRaises(OSError):
+                S.cdp_ws_connect("127.0.0.1", 19224, 5, token="sekrit")
+            self.assertEqual(seen.get("auth"), "Bearer sekrit")
+        finally:
+            srv.shutdown()
+
     def test_spider_uses_resources(self):
         op = S.make_opener(10, False)
         try:
